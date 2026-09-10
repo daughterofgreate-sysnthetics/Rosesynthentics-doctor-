@@ -61,20 +61,54 @@ SCAN_INTERVAL_SECONDS = int(
 # ============================================================
 
 TARGET_NAMES = {
-
-    "CRASH 1000": [
-        "Crash 1000",
-        "Crash 1000 Index",
-    ],
-
-    "BOOM 1000": [
-        "Boom 1000",
-        "Boom 1000 Index",
+    "CRASH 300": [
+        "Crash 300",
+        "Crash 300 Index"
     ],
 
     "CRASH 500": [
         "Crash 500",
-        "Crash 500 Index",
+        "Crash 500 Index"
+    ],
+
+    "CRASH 600": [
+        "Crash 600",
+        "Crash 600 Index"
+    ],
+
+    "CRASH 900": [
+        "Crash 900",
+        "Crash 900 Index"
+    ],
+
+    "CRASH 1000": [
+        "Crash 1000",
+        "Crash 1000 Index"
+    ],
+
+    "BOOM 300": [
+        "Boom 300",
+        "Boom 300 Index"
+    ],
+
+    "BOOM 500": [
+        "Boom 500",
+        "Boom 500 Index"
+    ],
+
+    "BOOM 600": [
+        "Boom 600",
+        "Boom 600 Index"
+    ],
+
+    "BOOM 900": [
+        "Boom 900",
+        "Boom 900 Index"
+    ],
+
+    "BOOM 1000": [
+        "Boom 1000",
+        "Boom 1000 Index"
     ],
 }
 
