@@ -1,47 +1,55 @@
 import os
 import json
 import time
-import math
 import requests
 import websocket
 import pandas as pd
 import numpy as np
 
+
 # ============================================================
 # CONFIG
 # ============================================================
 
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
-
-DERIV_WS_URL = (
-    f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-)
+# Public Deriv market-data WebSocket.
+# No Deriv token or App ID is required.
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile"
+)
 
 STATE_FILE = "state.json"
 
-# Signal thresholds
-SIGNAL_MIN = 7
+# Score thresholds
 WATCH_MIN = 5
+SIGNAL_MIN = 7
 
-# Instruments requested
+
+# Requested indices.
+# The scanner discovers their real Deriv symbol codes automatically.
 TARGETS = {
     "CRASH 1000": [
-        "Crash 1000",
-        "Crash 1000 Index",
+        "crash 1000",
+        "crash1000",
+        "crash 1000 index",
     ],
+
     "BOOM 1000": [
-        "Boom 1000",
-        "Boom 1000 Index",
+        "boom 1000",
+        "boom1000",
+        "boom 1000 index",
     ],
+
     "CRASH 500": [
-        "Crash 500",
-        "Crash 500 Index",
+        "crash 500",
+        "crash500",
+        "crash 500 index",
     ],
 }
 
@@ -59,44 +67,80 @@ def log(message):
 # ============================================================
 
 def load_state():
+
     try:
+
         if not os.path.exists(STATE_FILE):
             return {}
 
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             return json.load(f)
 
-    except Exception:
+    except Exception as e:
+
+        log(f"STATE LOAD ERROR: {e}")
+
         return {}
 
 
 def save_state(state):
+
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                state,
+                f,
+                indent=2
+            )
+
     except Exception as e:
+
         log(f"STATE SAVE ERROR: {e}")
 
 
 # ============================================================
-# DERIV CONNECTION
+# DERIV WEBSOCKET
 # ============================================================
 
-def deriv_connect():
+def connect_deriv():
+
+    log("Connecting to Deriv...")
+
     ws = websocket.create_connection(
         DERIV_WS_URL,
         timeout=30
     )
 
+    log("Deriv WebSocket connected.")
+
     return ws
 
 
-def deriv_request(ws, payload, timeout=30):
+def deriv_request(
+    ws,
+    payload,
+    timeout=30
+):
+
     ws.settimeout(timeout)
 
-    ws.send(json.dumps(payload))
+    ws.send(
+        json.dumps(payload)
+    )
 
     while True:
+
         raw = ws.recv()
 
         if not raw:
@@ -105,10 +149,13 @@ def deriv_request(ws, payload, timeout=30):
         data = json.loads(raw)
 
         if "error" in data:
+
+            error = data["error"]
+
             raise RuntimeError(
-                data["error"].get(
+                error.get(
                     "message",
-                    str(data["error"])
+                    str(error)
                 )
             )
 
@@ -120,6 +167,12 @@ def deriv_request(ws, payload, timeout=30):
 # ============================================================
 
 def get_active_symbols(ws):
+
+    log("Requesting Deriv active symbols...")
+
+    # IMPORTANT:
+    # Do NOT send product_type.
+    # Current Deriv API removed that parameter.
     response = deriv_request(
         ws,
         {
@@ -128,56 +181,112 @@ def get_active_symbols(ws):
         }
     )
 
-    symbols = response.get("active_symbols", [])
+    symbols = response.get(
+        "active_symbols",
+        []
+    )
 
     if not symbols:
-        raise RuntimeError("Deriv returned no active symbols")
+
+        raise RuntimeError(
+            "Deriv returned no active symbols. "
+            f"Full response: {response}"
+        )
+
+    log(
+        f"Deriv returned "
+        f"{len(symbols)} active symbols."
+    )
 
     return symbols
 
 
-def get_symbol_name(item):
-    return (
-        item.get("display_name")
-        or item.get("underlying_symbol_name")
-        or item.get("name")
-        or ""
-    )
+# ============================================================
+# SYMBOL HELPERS
+# ============================================================
+
+def symbol_code(item):
+
+    # New API field
+    if item.get("underlying_symbol"):
+        return item["underlying_symbol"]
+
+    # Legacy API field
+    if item.get("symbol"):
+        return item["symbol"]
+
+    return ""
 
 
-def get_symbol_code(item):
-    return (
-        item.get("symbol")
-        or item.get("underlying_symbol")
-        or ""
-    )
+def symbol_name(item):
+
+    # New API field
+    if item.get("underlying_symbol_name"):
+        return item["underlying_symbol_name"]
+
+    # Legacy API field
+    if item.get("display_name"):
+        return item["display_name"]
+
+    return ""
 
 
-def find_target_symbols(active_symbols):
+def find_symbol(
+    active_symbols,
+    target
+):
+
+    wanted_names = TARGETS[target]
+
+    for item in active_symbols:
+
+        code = symbol_code(item)
+        name = symbol_name(item)
+
+        combined = (
+            f"{name} {code}"
+        ).lower()
+
+        for wanted in wanted_names:
+
+            if wanted in combined:
+
+                return code, name
+
+    return None, None
+
+
+def discover_symbols(
+    active_symbols
+):
 
     found = {}
 
-    for target_name, possible_names in TARGETS.items():
+    for target in TARGETS:
 
-        best = None
+        code, name = find_symbol(
+            active_symbols,
+            target
+        )
 
-        for item in active_symbols:
+        found[target] = {
+            "code": code,
+            "name": name
+        }
 
-            name = get_symbol_name(item)
-            code = get_symbol_code(item)
+        if code:
 
-            name_lower = name.lower()
+            log(
+                f"{target} -> "
+                f"{code} "
+                f"({name})"
+            )
 
-            for wanted in possible_names:
+        else:
 
-                if wanted.lower() in name_lower:
-                    best = code
-                    break
-
-            if best:
-                break
-
-        found[target_name] = best
+            log(
+                f"{target} -> NOT FOUND"
+            )
 
     return found
 
@@ -186,7 +295,12 @@ def find_target_symbols(active_symbols):
 # HISTORICAL CANDLES
 # ============================================================
 
-def get_candles(ws, symbol, minutes, count=250):
+def get_candles(
+    ws,
+    symbol,
+    minutes,
+    count=250
+):
 
     granularity = minutes * 60
 
@@ -199,16 +313,24 @@ def get_candles(ws, symbol, minutes, count=250):
             "end": "latest",
             "style": "candles",
             "granularity": granularity,
-            "req_id": int(time.time() * 1000) % 100000000
+            "req_id": int(
+                time.time() * 1000
+            ) % 100000000
         },
-        timeout=40
+        timeout=45
     )
 
-    candles = response.get("candles", [])
+    candles = response.get(
+        "candles",
+        []
+    )
 
     if not candles:
+
         raise RuntimeError(
-            f"No candles returned for {symbol} {minutes}m"
+            f"No candles returned for "
+            f"{symbol} {minutes}m. "
+            f"Response: {response}"
         )
 
     rows = []
@@ -216,17 +338,32 @@ def get_candles(ws, symbol, minutes, count=250):
     for candle in candles:
 
         try:
-            rows.append({
-                "time": pd.to_datetime(
-                    int(candle["epoch"]),
-                    unit="s",
-                    utc=True
-                ),
-                "open": float(candle["open"]),
-                "high": float(candle["high"]),
-                "low": float(candle["low"]),
-                "close": float(candle["close"]),
-            })
+
+            rows.append(
+                {
+                    "time": pd.to_datetime(
+                        int(candle["epoch"]),
+                        unit="s",
+                        utc=True
+                    ),
+
+                    "open": float(
+                        candle["open"]
+                    ),
+
+                    "high": float(
+                        candle["high"]
+                    ),
+
+                    "low": float(
+                        candle["low"]
+                    ),
+
+                    "close": float(
+                        candle["close"]
+                    ),
+                }
+            )
 
         except Exception:
             continue
@@ -234,46 +371,73 @@ def get_candles(ws, symbol, minutes, count=250):
     df = pd.DataFrame(rows)
 
     if df.empty:
+
         raise RuntimeError(
-            f"Could not parse candles for {symbol}"
+            f"Could not parse candles "
+            f"for {symbol}"
         )
 
-    df = df.sort_values("time").drop_duplicates("time")
+    df = (
+        df
+        .sort_values("time")
+        .drop_duplicates("time")
+        .reset_index(drop=True)
+    )
 
-    # Remove the currently-forming candle.
-    now = pd.Timestamp.now(tz="UTC")
+    # Remove the currently forming candle.
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
 
-    candle_delta = pd.Timedelta(minutes=minutes)
+    current_candle_start = (
+        now.floor(f"{minutes}min")
+    )
 
-    cutoff = now.floor(f"{minutes}min")
-
-    df = df[df["time"] < cutoff]
+    df = df[
+        df["time"] <
+        current_candle_start
+    ]
 
     if len(df) < 60:
+
         raise RuntimeError(
-            f"Not enough completed candles for {symbol} {minutes}m"
+            f"Not enough completed candles "
+            f"for {symbol} {minutes}m: "
+            f"{len(df)}"
         )
 
-    return df.reset_index(drop=True)
+    return df
 
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
-def ema(series, length):
+def ema(
+    series,
+    length
+):
+
     return series.ewm(
         span=length,
         adjust=False
     ).mean()
 
 
-def rsi(series, length=14):
+def rsi(
+    series,
+    length=14
+):
 
     delta = series.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / length,
@@ -285,20 +449,45 @@ def rsi(series, length=14):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
+    )
 
-    result = 100 - (100 / (1 + rs))
+    result = (
+        100 -
+        (100 / (1 + rs))
+    )
 
     return result.fillna(50)
 
 
-def atr(df, length=14):
+def atr(
+    df,
+    length=14
+):
 
-    previous_close = df["close"].shift(1)
+    previous_close = (
+        df["close"].shift(1)
+    )
 
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - previous_close).abs()
-    tr3 = (df["low"] - previous_close).abs()
+    tr1 = (
+        df["high"] -
+        df["low"]
+    )
+
+    tr2 = (
+        df["high"] -
+        previous_close
+    ).abs()
+
+    tr3 = (
+        df["low"] -
+        previous_close
+    ).abs()
 
     true_range = pd.concat(
         [tr1, tr2, tr3],
@@ -311,18 +500,34 @@ def atr(df, length=14):
     ).mean()
 
 
-def supertrend(df, period=10, multiplier=3.0):
+def supertrend(
+    df,
+    period=10,
+    multiplier=3.0
+):
 
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
-    atr_value = atr(df, period)
+    atr_value = atr(
+        df,
+        period
+    )
 
-    hl2 = (high + low) / 2
+    hl2 = (
+        high + low
+    ) / 2
 
-    upper_basic = hl2 + multiplier * atr_value
-    lower_basic = hl2 - multiplier * atr_value
+    upper_basic = (
+        hl2 +
+        multiplier * atr_value
+    )
+
+    lower_basic = (
+        hl2 -
+        multiplier * atr_value
+    )
 
     upper = upper_basic.copy()
     lower = lower_basic.copy()
@@ -334,36 +539,65 @@ def supertrend(df, period=10, multiplier=3.0):
 
     direction.iloc[0] = 1
 
-    for i in range(1, len(df)):
+    for i in range(
+        1,
+        len(df)
+    ):
 
         if (
-            lower_basic.iloc[i] > lower.iloc[i - 1]
-            or close.iloc[i - 1] < lower.iloc[i - 1]
+            lower_basic.iloc[i]
+            > lower.iloc[i - 1]
+            or
+            close.iloc[i - 1]
+            < lower.iloc[i - 1]
         ):
-            lower.iloc[i] = lower_basic.iloc[i]
+
+            lower.iloc[i] = (
+                lower_basic.iloc[i]
+            )
+
         else:
-            lower.iloc[i] = lower.iloc[i - 1]
+
+            lower.iloc[i] = (
+                lower.iloc[i - 1]
+            )
 
         if (
-            upper_basic.iloc[i] < upper.iloc[i - 1]
-            or close.iloc[i - 1] > upper.iloc[i - 1]
+            upper_basic.iloc[i]
+            < upper.iloc[i - 1]
+            or
+            close.iloc[i - 1]
+            > upper.iloc[i - 1]
         ):
-            upper.iloc[i] = upper_basic.iloc[i]
+
+            upper.iloc[i] = (
+                upper_basic.iloc[i]
+            )
+
         else:
-            upper.iloc[i] = upper.iloc[i - 1]
+
+            upper.iloc[i] = (
+                upper.iloc[i - 1]
+            )
 
         if direction.iloc[i - 1] == -1:
 
             if close.iloc[i] > upper.iloc[i]:
+
                 direction.iloc[i] = 1
+
             else:
+
                 direction.iloc[i] = -1
 
         else:
 
             if close.iloc[i] < lower.iloc[i]:
+
                 direction.iloc[i] = -1
+
             else:
+
                 direction.iloc[i] = 1
 
     return direction
@@ -373,174 +607,250 @@ def supertrend(df, period=10, multiplier=3.0):
 # TIMEFRAME ANALYSIS
 # ============================================================
 
-def timeframe_analysis(df):
+def analyze_timeframe(df):
 
     df = df.copy()
 
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    df["rsi"] = rsi(df["close"], 14)
-    df["atr"] = atr(df, 14)
-    df["st"] = supertrend(df, 10, 3.0)
+    df["ema20"] = ema(
+        df["close"],
+        20
+    )
+
+    df["ema50"] = ema(
+        df["close"],
+        50
+    )
+
+    df["rsi"] = rsi(
+        df["close"],
+        14
+    )
+
+    df["atr"] = atr(
+        df,
+        14
+    )
+
+    df["st"] = supertrend(
+        df,
+        10,
+        3.0
+    )
 
     last = df.iloc[-1]
-    previous = df.iloc[-2]
 
     score = 0
+
     reasons = []
 
-    # EMA trend
-    if last["close"] > last["ema20"] > last["ema50"]:
-        score += 1
-        reasons.append("EMA bullish")
+    # EMA
+    if (
+        last["close"]
+        >
+        last["ema20"]
+        >
+        last["ema50"]
+    ):
 
-    elif last["close"] < last["ema20"] < last["ema50"]:
+        score += 1
+
+        reasons.append(
+            "EMA bullish"
+        )
+
+    elif (
+        last["close"]
+        <
+        last["ema20"]
+        <
+        last["ema50"]
+    ):
+
         score -= 1
-        reasons.append("EMA bearish")
+
+        reasons.append(
+            "EMA bearish"
+        )
 
     # Supertrend
     if last["st"] == 1:
+
         score += 1
-        reasons.append("Supertrend bullish")
+
+        reasons.append(
+            "Supertrend bullish"
+        )
 
     else:
-        score -= 1
-        reasons.append("Supertrend bearish")
 
-    # RSI broad bias
-    if last["rsi"] >= 55:
-        score += 1
+        score -= 1
+
         reasons.append(
-            f"RSI bullish {last['rsi']:.1f}"
+            "Supertrend bearish"
+        )
+
+    # RSI
+    if last["rsi"] >= 55:
+
+        score += 1
+
+        reasons.append(
+            f"RSI bullish "
+            f"{last['rsi']:.1f}"
         )
 
     elif last["rsi"] <= 45:
+
         score -= 1
+
         reasons.append(
-            f"RSI bearish {last['rsi']:.1f}"
+            f"RSI bearish "
+            f"{last['rsi']:.1f}"
         )
 
     return {
         "score": score,
-        "close": float(last["close"]),
-        "ema20": float(last["ema20"]),
-        "ema50": float(last["ema50"]),
-        "rsi": float(last["rsi"]),
-        "supertrend": int(last["st"]),
-        "candle_time": last["time"].isoformat(),
-        "reasons": reasons,
+
+        "close": float(
+            last["close"]
+        ),
+
+        "ema20": float(
+            last["ema20"]
+        ),
+
+        "ema50": float(
+            last["ema50"]
+        ),
+
+        "rsi": float(
+            last["rsi"]
+        ),
+
+        "supertrend": int(
+            last["st"]
+        ),
+
+        "candle_time":
+            last["time"].isoformat(),
+
+        "reasons": reasons
     }
 
 
 # ============================================================
-# 5M ENTRY CONFIRMATION
+# 5 MINUTE CONFIRMATION
 # ============================================================
 
-def five_min_confirmation(df):
+def analyze_5m(df):
 
     df = df.copy()
 
-    df["ema20"] = ema(df["close"], 20)
-    df["st"] = supertrend(df, 10, 3.0)
+    df["ema20"] = ema(
+        df["close"],
+        20
+    )
+
+    df["st"] = supertrend(
+        df,
+        10,
+        3.0
+    )
 
     last = df.iloc[-1]
     previous = df.iloc[-2]
 
-    bullish = False
-    bearish = False
-
-    reasons = []
-
-    # Bullish confirmation
-    if last["close"] > last["ema20"]:
-        bullish = True
-        reasons.append("5M above EMA20")
-
-    if last["st"] == 1:
-        bullish = True
-        reasons.append("5M Supertrend bullish")
-
-    if last["close"] > previous["high"]:
-        bullish = True
-        reasons.append("5M broke previous high")
-
-    # Bearish confirmation
-    bearish_reasons = []
-
-    if last["close"] < last["ema20"]:
-        bearish_reasons.append("5M below EMA20")
-
-    if last["st"] == -1:
-        bearish_reasons.append("5M Supertrend bearish")
-
-    if last["close"] < previous["low"]:
-        bearish_reasons.append("5M broke previous low")
-
-    # We need at least 2 confirmations
     bull_count = 0
-
-    if last["close"] > last["ema20"]:
-        bull_count += 1
-
-    if last["st"] == 1:
-        bull_count += 1
-
-    if last["close"] > previous["high"]:
-        bull_count += 1
-
     bear_count = 0
 
-    if last["close"] < last["ema20"]:
+    bull_reasons = []
+    bear_reasons = []
+
+    # EMA
+    if last["close"] > last["ema20"]:
+
+        bull_count += 1
+
+        bull_reasons.append(
+            "above EMA20"
+        )
+
+    elif last["close"] < last["ema20"]:
+
         bear_count += 1
 
-    if last["st"] == -1:
+        bear_reasons.append(
+            "below EMA20"
+        )
+
+    # Supertrend
+    if last["st"] == 1:
+
+        bull_count += 1
+
+        bull_reasons.append(
+            "Supertrend bullish"
+        )
+
+    else:
+
         bear_count += 1
+
+        bear_reasons.append(
+            "Supertrend bearish"
+        )
+
+    # Break
+    if last["close"] > previous["high"]:
+
+        bull_count += 1
+
+        bull_reasons.append(
+            "broke previous high"
+        )
 
     if last["close"] < previous["low"]:
+
         bear_count += 1
 
-    bullish = bull_count >= 2
-    bearish = bear_count >= 2
-
-    if bullish:
-        reasons.extend([
-            "5M bullish confirmation"
-        ] + [
-            x for x in [
-                "5M above EMA20"
-                if last["close"] > last["ema20"]
-                else None,
-                "5M Supertrend bullish"
-                if last["st"] == 1
-                else None,
-                "5M broke previous high"
-                if last["close"] > previous["high"]
-                else None,
-            ]
-            if x
-        ])
-
-    if bearish:
-        reasons.extend(
-            ["5M bearish confirmation"] +
-            bearish_reasons
+        bear_reasons.append(
+            "broke previous low"
         )
+
+    bullish = (
+        bull_count >= 2
+    )
+
+    bearish = (
+        bear_count >= 2
+    )
 
     return {
         "bullish": bullish,
         "bearish": bearish,
-        "bull_count": bull_count,
-        "bear_count": bear_count,
-        "reasons": list(dict.fromkeys(reasons)),
-        "candle_time": last["time"].isoformat(),
+
+        "bull_count":
+            bull_count,
+
+        "bear_count":
+            bear_count,
+
+        "bull_reasons":
+            bull_reasons,
+
+        "bear_reasons":
+            bear_reasons,
+
+        "candle_time":
+            last["time"].isoformat()
     }
 
 
 # ============================================================
-# MAIN SCORING ENGINE
+# SCORE ENGINE
 # ============================================================
 
-def score_market(
+def calculate_score(
     h12,
     h4,
     h1,
@@ -548,115 +858,162 @@ def score_market(
     m5
 ):
 
-    buy_score = 0
-    sell_score = 0
+    buy = 0
+    sell = 0
 
     buy_reasons = []
     sell_reasons = []
 
-    # --------------------------------------------------------
-    # 12H
-    # --------------------------------------------------------
-
+    # 12H = 1 point
     if h12["score"] > 0:
-        buy_score += 1
-        buy_reasons.append("12H bullish context")
+
+        buy += 1
+
+        buy_reasons.append(
+            "12H bullish"
+        )
 
     elif h12["score"] < 0:
-        sell_score += 1
-        sell_reasons.append("12H bearish context")
 
-    # --------------------------------------------------------
-    # 4H
-    # --------------------------------------------------------
+        sell += 1
 
+        sell_reasons.append(
+            "12H bearish"
+        )
+
+    # 4H = 1 point
     if h4["score"] > 0:
-        buy_score += 1
-        buy_reasons.append("4H bullish context")
+
+        buy += 1
+
+        buy_reasons.append(
+            "4H bullish"
+        )
 
     elif h4["score"] < 0:
-        sell_score += 1
-        sell_reasons.append("4H bearish context")
 
-    # --------------------------------------------------------
-    # 1H
-    # --------------------------------------------------------
+        sell += 1
 
+        sell_reasons.append(
+            "4H bearish"
+        )
+
+    # 1H = 2 points
     if h1["score"] > 0:
-        buy_score += 2
-        buy_reasons.append("1H bullish bias")
+
+        buy += 2
+
+        buy_reasons.append(
+            "1H bullish"
+        )
 
     elif h1["score"] < 0:
-        sell_score += 2
-        sell_reasons.append("1H bearish bias")
 
-    # --------------------------------------------------------
-    # 15M
-    # --------------------------------------------------------
+        sell += 2
 
+        sell_reasons.append(
+            "1H bearish"
+        )
+
+    # 15M = 3 points
     if m15["score"] > 0:
-        buy_score += 3
-        buy_reasons.append("15M bullish setup")
+
+        buy += 3
+
+        buy_reasons.append(
+            "15M bullish setup"
+        )
 
     elif m15["score"] < 0:
-        sell_score += 3
-        sell_reasons.append("15M bearish setup")
 
-    # --------------------------------------------------------
-    # 5M
-    # --------------------------------------------------------
+        sell += 3
 
+        sell_reasons.append(
+            "15M bearish setup"
+        )
+
+    # 5M = 2 points
     if m5["bullish"]:
-        buy_score += 2
-        buy_reasons.append("5M entry confirmation")
+
+        buy += 2
+
+        buy_reasons.append(
+            "5M bullish confirmation"
+        )
 
     elif m5["bearish"]:
-        sell_score += 2
-        sell_reasons.append("5M entry confirmation")
 
-    # --------------------------------------------------------
-    # Decide technical direction
-    # --------------------------------------------------------
+        sell += 2
 
-    direction = "NONE"
-    score = max(buy_score, sell_score)
-    reasons = []
+        sell_reasons.append(
+            "5M bearish confirmation"
+        )
 
-    if buy_score > sell_score:
+    # Direction
+    if buy > sell:
+
         direction = "BUY"
+        score = buy
         reasons = buy_reasons
 
-    elif sell_score > buy_score:
+    elif sell > buy:
+
         direction = "SELL"
+        score = sell
         reasons = sell_reasons
 
     else:
-        direction = "NONE"
 
-    # Do not allow a weak 15M setup to become a signal
-    if direction == "BUY" and m15["score"] <= 0:
         direction = "NONE"
+        score = 0
+        reasons = []
 
-    if direction == "SELL" and m15["score"] >= 0:
-        direction = "NONE"
+    # 15M must agree with direction.
+    if direction == "BUY":
 
-    # Technical status
-    if direction != "NONE" and score >= SIGNAL_MIN:
+        if m15["score"] <= 0:
+
+            direction = "NONE"
+            score = 0
+            reasons = []
+
+    elif direction == "SELL":
+
+        if m15["score"] >= 0:
+
+            direction = "NONE"
+            score = 0
+            reasons = []
+
+    # Status
+    if (
+        direction != "NONE"
+        and score >= SIGNAL_MIN
+    ):
+
         status = "SIGNAL"
 
-    elif direction != "NONE" and score >= WATCH_MIN:
+    elif (
+        direction != "NONE"
+        and score >= WATCH_MIN
+    ):
+
         status = "WATCH"
 
     else:
+
         status = "PASS"
 
     return {
         "direction": direction,
         "status": status,
-        "buy_score": buy_score,
-        "sell_score": sell_score,
+
         "score": score,
-        "reasons": reasons,
+
+        "buy_score": buy,
+        "sell_score": sell,
+
+        "reasons": reasons
     }
 
 
@@ -675,20 +1032,24 @@ def groq_review(
 ):
 
     if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY missing")
+
+        raise RuntimeError(
+            "GROQ_API_KEY missing"
+        )
+
+    from groq import Groq
+
+    client = Groq(
+        api_key=GROQ_API_KEY
+    )
 
     prompt = f"""
-You are the final reviewer for a synthetic-index technical scanner.
+You are the final technical reviewer
+for a synthetic-indices scanner.
 
-IMPORTANT:
-- This is analysis only.
-- Do NOT place trades.
-- Do NOT invent market data.
-- Do NOT change the technical direction unless the evidence clearly contradicts it.
-- The scanner should NOT be excessively strict.
-- A WATCH is allowed when the setup is developing.
-- A SIGNAL is allowed when the technical score is strong enough.
-- Return exactly one decision: BUY, SELL, WATCH, or PASS.
+This system is analysis only.
+Do NOT place trades.
+Do NOT invent data.
 
 Instrument:
 {instrument}
@@ -713,23 +1074,22 @@ Technical proposal:
 
 Rules:
 
-1. If technical direction is BUY:
-   - You may return BUY, WATCH, or PASS.
-   - Do not return SELL.
+- If technical direction is BUY,
+  AI may return BUY, WATCH or PASS.
+  Never return SELL.
 
-2. If technical direction is SELL:
-   - You may return SELL, WATCH, or PASS.
-   - Do not return BUY.
+- If technical direction is SELL,
+  AI may return SELL, WATCH or PASS.
+  Never return BUY.
 
-3. If technical direction is NONE:
-   - Return PASS.
+- If technical direction is NONE,
+  return PASS.
 
-4. Prefer WATCH when the setup is developing but not strong enough
-   for a full signal.
+- Do not be excessively strict.
 
-5. Prefer PASS when the timeframes strongly conflict.
+- WATCH is allowed when a setup is developing.
 
-6. Never invent price levels.
+- PASS when timeframes strongly conflict.
 
 Return JSON only:
 
@@ -740,59 +1100,75 @@ Return JSON only:
 }}
 """
 
-    from groq import Groq
-
-    client = Groq(
-        api_key=GROQ_API_KEY
-    )
-
     response = client.chat.completions.create(
         model=GROQ_MODEL,
         temperature=0.1,
-        max_tokens=300,
+        max_tokens=250,
+
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "You are a disciplined technical market "
-                    "reviewer. Return valid JSON only."
-                ),
+                "content":
+                    "Return valid JSON only."
             },
+
             {
                 "role": "user",
-                "content": prompt,
-            },
-        ],
+                "content": prompt
+            }
+        ]
     )
 
-    content = response.choices[0].message.content.strip()
+    text = (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
 
-    # Remove markdown fences if model adds them
-    content = content.replace("```json", "")
-    content = content.replace("```", "")
-    content = content.strip()
+    text = text.replace(
+        "```json",
+        ""
+    )
 
-    result = json.loads(content)
+    text = text.replace(
+        "```",
+        ""
+    ).strip()
+
+    result = json.loads(text)
 
     decision = str(
-        result.get("decision", "PASS")
+        result.get(
+            "decision",
+            "PASS"
+        )
     ).upper()
 
     if decision not in {
         "BUY",
         "SELL",
         "WATCH",
-        "PASS",
+        "PASS"
     }:
+
         decision = "PASS"
 
     return {
         "decision": decision,
-        "confidence": result.get("confidence", 0),
-        "reason": result.get(
-            "reason",
-            "No reason provided"
-        ),
+
+        "confidence":
+            result.get(
+                "confidence",
+                0
+            ),
+
+        "reason":
+            result.get(
+                "reason",
+                ""
+            )
     }
 
 
@@ -803,40 +1179,47 @@ Return JSON only:
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
+
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN missing"
         )
 
     if not TELEGRAM_CHAT_ID:
+
         raise RuntimeError(
             "TELEGRAM_CHAT_ID missing"
         )
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     response = requests.post(
         url,
+
         json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
+            "chat_id":
+                TELEGRAM_CHAT_ID,
+
+            "text":
+                message
         },
-        timeout=20,
+
+        timeout=20
     )
 
     response.raise_for_status()
 
 
 # ============================================================
-# FORMAT ALERT
+# TELEGRAM MESSAGE
 # ============================================================
 
-def format_alert(
+def create_message(
     instrument,
-    groq_result,
     technical,
+    ai,
     h12,
     h4,
     h1,
@@ -844,47 +1227,48 @@ def format_alert(
     m5
 ):
 
-    decision = groq_result["decision"]
+    decision = ai["decision"]
 
-    emoji = {
-        "BUY": "🟢",
-        "SELL": "🔴",
-        "WATCH": "🟡",
-        "PASS": "⚪",
-    }.get(decision, "⚪")
+    if decision == "BUY":
+        icon = "🟢"
 
-    lines = [
-        f"{emoji} {decision} — {instrument}",
-        "",
-        f"Score: {technical['score']}",
-        f"Buy score: {technical['buy_score']}",
-        f"Sell score: {technical['sell_score']}",
-        "",
-        f"12H: {h12['score']}",
-        f"4H: {h4['score']}",
-        f"1H: {h1['score']}",
-        f"15M: {m15['score']}",
-        "",
-        (
-            f"5M confirmation: "
-            f"Bull={m5['bull_count']} "
-            f"Bear={m5['bear_count']}"
-        ),
-        "",
-        f"AI confidence: {groq_result['confidence']}",
-        f"AI review: {groq_result['reason']}",
-        "",
-        "Analysis only — no auto trading.",
-    ]
+    elif decision == "SELL":
+        icon = "🔴"
 
-    return "\n".join(lines)
+    else:
+        icon = "🟡"
+
+    return (
+        f"{icon} {decision} — {instrument}\n"
+        f"\n"
+        f"Score: {technical['score']}\n"
+        f"Buy score: {technical['buy_score']}\n"
+        f"Sell score: {technical['sell_score']}\n"
+        f"\n"
+        f"12H: {h12['score']}\n"
+        f"4H: {h4['score']}\n"
+        f"1H: {h1['score']}\n"
+        f"15M: {m15['score']}\n"
+        f"\n"
+        f"5M Bull: {m5['bull_count']}\n"
+        f"5M Bear: {m5['bear_count']}\n"
+        f"\n"
+        f"AI confidence: "
+        f"{ai['confidence']}\n"
+        f"\n"
+        f"AI review: "
+        f"{ai['reason']}\n"
+        f"\n"
+        f"Analysis only — "
+        f"no auto trading."
+    )
 
 
 # ============================================================
-# SCAN ONE INSTRUMENT
+# SCAN ONE INDEX
 # ============================================================
 
-def scan_instrument(
+def scan_index(
     ws,
     instrument,
     symbol,
@@ -893,12 +1277,19 @@ def scan_instrument(
 
     log("")
     log("=" * 60)
-    log(f"SCANNING {instrument}")
-    log(f"SYMBOL: {symbol}")
+
+    log(
+        f"SCANNING {instrument}"
+    )
+
+    log(
+        f"Symbol: {symbol}"
+    )
+
     log("=" * 60)
 
     # --------------------------------------------------------
-    # Fetch all timeframes
+    # Get all required timeframes
     # --------------------------------------------------------
 
     h12_df = get_candles(
@@ -937,21 +1328,34 @@ def scan_instrument(
     )
 
     # --------------------------------------------------------
-    # Indicators
+    # Analyze
     # --------------------------------------------------------
 
-    h12 = timeframe_analysis(h12_df)
-    h4 = timeframe_analysis(h4_df)
-    h1 = timeframe_analysis(h1_df)
-    m15 = timeframe_analysis(m15_df)
+    h12 = analyze_timeframe(
+        h12_df
+    )
 
-    m5 = five_min_confirmation(m5_df)
+    h4 = analyze_timeframe(
+        h4_df
+    )
+
+    h1 = analyze_timeframe(
+        h1_df
+    )
+
+    m15 = analyze_timeframe(
+        m15_df
+    )
+
+    m5 = analyze_5m(
+        m5_df
+    )
 
     # --------------------------------------------------------
-    # Technical score
+    # Score
     # --------------------------------------------------------
 
-    technical = score_market(
+    technical = calculate_score(
         h12,
         h4,
         h1,
@@ -961,7 +1365,6 @@ def scan_instrument(
 
     log(
         f"{instrument} "
-        f"TECHNICAL "
         f"direction={technical['direction']} "
         f"status={technical['status']} "
         f"buy={technical['buy_score']} "
@@ -969,23 +1372,27 @@ def scan_instrument(
     )
 
     # --------------------------------------------------------
-    # If no technical setup, don't waste Groq call
+    # No setup
     # --------------------------------------------------------
 
     if technical["status"] == "PASS":
 
         log(
-            f"{instrument} PASS - "
-            f"no valid technical setup"
+            f"{instrument} NO SETUP"
         )
 
         return
 
     # --------------------------------------------------------
-    # Groq is REQUIRED for every WATCH/SIGNAL
+    # Groq review
     # --------------------------------------------------------
 
-    groq_result = groq_review(
+    log(
+        f"{instrument} "
+        f"sending setup to Groq..."
+    )
+
+    ai = groq_review(
         instrument,
         technical,
         h12,
@@ -997,72 +1404,79 @@ def scan_instrument(
 
     log(
         f"{instrument} GROQ "
-        f"decision={groq_result['decision']} "
-        f"confidence={groq_result['confidence']}"
+        f"decision={ai['decision']} "
+        f"confidence={ai['confidence']}"
     )
 
-    decision = groq_result["decision"]
-
     # --------------------------------------------------------
-    # Safety: AI must agree with technical direction
+    # AI cannot reverse technical direction
     # --------------------------------------------------------
 
-    if decision in {"BUY", "SELL"}:
+    if ai["decision"] in {
+        "BUY",
+        "SELL"
+    }:
 
-        if decision != technical["direction"]:
+        if (
+            ai["decision"]
+            != technical["direction"]
+        ):
 
             log(
-                f"{instrument} AI direction rejected: "
-                f"technical={technical['direction']} "
-                f"AI={decision}"
+                f"{instrument} "
+                f"AI direction rejected."
             )
 
             return
 
     # --------------------------------------------------------
-    # PASS = nothing
+    # PASS
     # --------------------------------------------------------
 
-    if decision == "PASS":
-        log(f"{instrument} GROQ PASS")
-        return
-
-    # --------------------------------------------------------
-    # Deduplication
-    # --------------------------------------------------------
-
-    candle_time = m5["candle_time"]
-
-    previous = state.get(instrument, {})
-
-    previous_decision = previous.get(
-        "decision"
-    )
-
-    previous_candle = previous.get(
-        "candle_time"
-    )
-
-    if (
-        previous_decision == decision
-        and previous_candle == candle_time
-    ):
+    if ai["decision"] == "PASS":
 
         log(
-            f"{instrument} DUPLICATE ALERT "
-            f"- not sending"
+            f"{instrument} GROQ PASS"
         )
 
         return
 
     # --------------------------------------------------------
-    # Send Telegram
+    # Duplicate prevention
     # --------------------------------------------------------
 
-    message = format_alert(
+    candle_time = m5[
+        "candle_time"
+    ]
+
+    previous = state.get(
         instrument,
-        groq_result,
+        {}
+    )
+
+    if (
+        previous.get("decision")
+        == ai["decision"]
+        and
+        previous.get("candle_time")
+        == candle_time
+    ):
+
+        log(
+            f"{instrument} "
+            f"DUPLICATE - not sending"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
+
+    message = create_message(
+        instrument,
         technical,
+        ai,
         h12,
         h4,
         h1,
@@ -1070,11 +1484,14 @@ def scan_instrument(
         m5
     )
 
-    send_telegram(message)
+    send_telegram(
+        message
+    )
 
     log(
-        f"{instrument} TELEGRAM ALERT SENT: "
-        f"{decision}"
+        f"{instrument} "
+        f"TELEGRAM ALERT SENT: "
+        f"{ai['decision']}"
     )
 
     # --------------------------------------------------------
@@ -1082,157 +1499,4 @@ def scan_instrument(
     # --------------------------------------------------------
 
     state[instrument] = {
-        "decision": decision,
-        "candle_time": candle_time,
-        "timestamp": pd.Timestamp.now(
-            tz="UTC"
-        ).isoformat(),
-    }
-
-    save_state(state)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    log("")
-    log("==============================================")
-    log("SYNTHETIC INDICES SCANNER")
-    log("==============================================")
-
-    log(
-        f"Deriv App ID: {DERIV_APP_ID}"
-    )
-
-    # --------------------------------------------------------
-    # Check required environment variables
-    # --------------------------------------------------------
-
-    missing = []
-
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-
-    if not GROQ_API_KEY:
-        missing.append("GROQ_API_KEY")
-
-    if missing:
-
-        for item in missing:
-            log(
-                f"ERROR: {item} missing"
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # Connect
-    # --------------------------------------------------------
-
-    ws = None
-
-    try:
-
-        log(
-            "Connecting to Deriv..."
-        )
-
-        ws = deriv_connect()
-
-        log(
-            "Deriv WebSocket connected."
-        )
-
-        # ----------------------------------------------------
-        # Discover symbols
-        # ----------------------------------------------------
-
-        active_symbols = get_active_symbols(
-            ws
-        )
-
-        log(
-            f"Deriv returned "
-            f"{len(active_symbols)} active symbols."
-        )
-
-        symbols = find_target_symbols(
-            active_symbols
-        )
-
-        for name, symbol in symbols.items():
-
-            if symbol:
-                log(
-                    f"{name} -> {symbol}"
-                )
-            else:
-                log(
-                    f"{name} -> NOT FOUND"
-                )
-
-        # ----------------------------------------------------
-        # State
-        # ----------------------------------------------------
-
-        state = load_state()
-
-        # ----------------------------------------------------
-        # Scan all targets
-        # ----------------------------------------------------
-
-        for instrument, symbol in symbols.items():
-
-            if not symbol:
-
-                log(
-                    f"{instrument} SKIPPED - "
-                    f"symbol not found"
-                )
-
-                continue
-
-            try:
-
-                scan_instrument(
-                    ws,
-                    instrument,
-                    symbol,
-                    state
-                )
-
-            except Exception as e:
-
-                log(
-                    f"{instrument} ERROR: {e}"
-                )
-
-        log("")
-        log(
-            "SCAN COMPLETED"
-        )
-
-    except Exception as e:
-
-        log(
-            f"FATAL ERROR: {e}"
-        )
-
-    finally:
-
-        if ws:
-
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-
-if __name__ == "__main__":
-    main()
+        "
