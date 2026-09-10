@@ -7,19 +7,33 @@ import pandas as pd
 import numpy as np
 
 # ============================================================
-# DERIV CURRENT PUBLIC API
+# DERIV CURRENT PUBLIC WEBSOCKET
 # ============================================================
 
-DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
+DERIV_WS_URL = (
+    "wss://api.derivws.com/"
+    "trading/v1/options/ws/public"
+)
 
 # ============================================================
 # ENVIRONMENT VARIABLES
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+)
+
+GROQ_API_KEY = os.getenv(
+    "GROQ_API_KEY",
+    ""
+)
+
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "llama-3.3-70b-versatile"
@@ -37,21 +51,23 @@ SIGNAL_MIN = 7
 TARGETS = {
     "CRASH 1000": [
         "crash 1000",
-        "crash1000"
+        "crash1000",
     ],
+
     "BOOM 1000": [
         "boom 1000",
-        "boom1000"
+        "boom1000",
     ],
+
     "CRASH 500": [
         "crash 500",
-        "crash500"
+        "crash500",
     ],
 }
 
 
 # ============================================================
-# LOGGING
+# LOG
 # ============================================================
 
 def log(message):
@@ -63,31 +79,52 @@ def log(message):
 # ============================================================
 
 def load_state():
+
     try:
+
+        if not os.path.exists(
+            STATE_FILE
+        ):
+            return {}
+
         with open(
             STATE_FILE,
             "r",
             encoding="utf-8"
         ) as f:
+
             return json.load(f)
-    except Exception:
+
+    except Exception as e:
+
+        log(
+            f"STATE LOAD ERROR: {e}"
+        )
+
         return {}
 
 
 def save_state(state):
+
     try:
+
         with open(
             STATE_FILE,
             "w",
             encoding="utf-8"
         ) as f:
+
             json.dump(
                 state,
                 f,
                 indent=2
             )
+
     except Exception as e:
-        log(f"STATE SAVE ERROR: {e}")
+
+        log(
+            f"STATE SAVE ERROR: {e}"
+        )
 
 
 # ============================================================
@@ -120,7 +157,7 @@ def connect_deriv():
 def deriv_request(
     ws,
     payload,
-    timeout=45
+    timeout=60
 ):
 
     ws.settimeout(timeout)
@@ -129,7 +166,7 @@ def deriv_request(
         json.dumps(payload)
     )
 
-    wanted_req_id = payload.get(
+    request_id = payload.get(
         "req_id"
     )
 
@@ -150,25 +187,33 @@ def deriv_request(
             data.get("error")
             or data.get("errors")
         ):
+
+            error = (
+                data.get("error")
+                or data.get("errors")
+            )
+
             raise RuntimeError(
-                str(
-                    data.get("error")
-                    or data.get("errors")
-                )
+                str(error)
             )
 
         if (
-            wanted_req_id is None
-            or data.get("req_id")
-            == wanted_req_id
+            request_id is None
+            or
+            data.get("req_id")
+            == request_id
         ):
+
             return data
 
-        if data.get("msg_type") in {
+        if data.get(
+            "msg_type"
+        ) in {
             "active_symbols",
             "candles",
             "history"
         }:
+
             return data
 
     raise TimeoutError(
@@ -183,7 +228,8 @@ def deriv_request(
 def get_active_symbols(ws):
 
     log(
-        "Requesting Deriv active symbols..."
+        "Requesting Deriv "
+        "active symbols..."
     )
 
     response = deriv_request(
@@ -208,7 +254,8 @@ def get_active_symbols(ws):
 
     log(
         "Deriv returned "
-        f"{len(symbols)} active symbols."
+        f"{len(symbols)} "
+        "active symbols."
     )
 
     return symbols
@@ -224,8 +271,12 @@ def get_symbol_code(item):
         item.get(
             "underlying_symbol"
         )
-        or item.get("symbol")
-        or ""
+        or
+        item.get(
+            "symbol"
+        )
+        or
+        ""
     )
 
 
@@ -235,8 +286,12 @@ def get_symbol_name(item):
         item.get(
             "underlying_symbol_name"
         )
-        or item.get("display_name")
-        or ""
+        or
+        item.get(
+            "display_name"
+        )
+        or
+        ""
     )
 
 
@@ -246,7 +301,9 @@ def discover_symbols(
 
     results = {}
 
-    for target, aliases in TARGETS.items():
+    for target, aliases in (
+        TARGETS.items()
+    ):
 
         found = None
 
@@ -261,7 +318,9 @@ def discover_symbols(
             )
 
             combined = (
-                name + " " + code
+                name
+                + " "
+                + code
             ).lower()
 
             for alias in aliases:
@@ -299,7 +358,7 @@ def discover_symbols(
 
 
 # ============================================================
-# CANDLE DATA
+# GET CANDLES
 # ============================================================
 
 def get_candles(
@@ -309,24 +368,61 @@ def get_candles(
     count=250
 ):
 
+    granularity = (
+        minutes * 60
+    )
+
+    supported = {
+        5: 300,
+        15: 900,
+        60: 3600,
+        240: 14400,
+    }
+
+    if minutes not in supported:
+
+        raise RuntimeError(
+            f"Unsupported timeframe: "
+            f"{minutes} minutes"
+        )
+
+    granularity = supported[
+        minutes
+    ]
+
     req_id = (
-        int(time.time() * 1000)
+        int(
+            time.time() * 1000
+        )
         % 1000000000
     )
 
+    payload = {
+        "ticks_history":
+            symbol,
+
+        "end":
+            "latest",
+
+        "style":
+            "candles",
+
+        "granularity":
+            granularity,
+
+        "count":
+            count,
+
+        "adjust_start_time":
+            1,
+
+        "req_id":
+            req_id
+    }
+
     response = deriv_request(
         ws,
-        {
-            "ticks_history": symbol,
-            "end": "latest",
-            "style": "candles",
-            "granularity":
-                minutes * 60,
-            "count": count,
-            "adjust_start_time": 1,
-            "subscribe": 0,
-            "req_id": req_id
-        },
+        payload,
         timeout=60
     )
 
@@ -338,8 +434,9 @@ def get_candles(
     if not candles:
 
         raise RuntimeError(
-            f"No candles for "
-            f"{symbol} {minutes}m: "
+            f"No candles returned "
+            f"for {symbol} "
+            f"{minutes}m: "
             f"{response}"
         )
 
@@ -390,8 +487,8 @@ def get_candles(
     if not rows:
 
         raise RuntimeError(
-            f"Could not parse candles "
-            f"for {symbol}"
+            f"Could not parse "
+            f"candles for {symbol}"
         )
 
     df = pd.DataFrame(
@@ -401,15 +498,21 @@ def get_candles(
     df = (
         df
         .sort_values("time")
-        .drop_duplicates("time")
-        .reset_index(drop=True)
+        .drop_duplicates(
+            "time"
+        )
+        .reset_index(
+            drop=True
+        )
     )
+
+    # Remove current incomplete candle.
 
     now = pd.Timestamp.now(
         tz="UTC"
     )
 
-    current_candle_start = (
+    current_start = (
         now.floor(
             f"{minutes}min"
         )
@@ -417,7 +520,8 @@ def get_candles(
 
     df = df[
         df["time"]
-        < current_candle_start
+        <
+        current_start
     ].reset_index(
         drop=True
     )
@@ -426,15 +530,64 @@ def get_candles(
 
         raise RuntimeError(
             f"Only {len(df)} "
-            f"completed candles for "
-            f"{symbol} {minutes}m"
+            f"completed candles "
+            f"for {symbol} "
+            f"{minutes}m"
         )
 
     return df
 
 
 # ============================================================
-# INDICATORS
+# BUILD 12H FROM 4H
+# ============================================================
+
+def resample_12h(
+    df
+):
+
+    data = df.copy()
+
+    data = data.sort_values(
+        "time"
+    )
+
+    data = data.set_index(
+        "time"
+    )
+
+    result = (
+        data
+        .resample(
+            "12h",
+            origin="epoch"
+        )
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last"
+            }
+        )
+    )
+
+    result = result.dropna()
+
+    result = result.reset_index()
+
+    if len(result) < 60:
+
+        raise RuntimeError(
+            "Not enough 12H candles "
+            "after 4H aggregation"
+        )
+
+    return result
+
+
+# ============================================================
+# EMA
 # ============================================================
 
 def ema(
@@ -447,6 +600,10 @@ def ema(
         adjust=False
     ).mean()
 
+
+# ============================================================
+# RSI
+# ============================================================
 
 def rsi(
     series,
@@ -492,8 +649,14 @@ def rsi(
         )
     )
 
-    return result.fillna(50)
+    return result.fillna(
+        50
+    )
 
+
+# ============================================================
+# ATR
+# ============================================================
 
 def atr(
     df,
@@ -529,7 +692,9 @@ def atr(
             tr3
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return true_range.ewm(
         alpha=1 / length,
@@ -574,8 +739,13 @@ def supertrend(
         atr_value
     )
 
-    upper = upper_basic.copy()
-    lower = lower_basic.copy()
+    upper = (
+        upper_basic.copy()
+    )
+
+    lower = (
+        lower_basic.copy()
+    )
 
     direction = pd.Series(
         1,
@@ -666,7 +836,9 @@ def supertrend(
 # TIMEFRAME ANALYSIS
 # ============================================================
 
-def analyze_timeframe(df):
+def analyze_timeframe(
+    df
+):
 
     data = df.copy()
 
@@ -685,6 +857,11 @@ def analyze_timeframe(df):
         14
     )
 
+    data["atr"] = atr(
+        data,
+        14
+    )
+
     data["st"] = supertrend(
         data,
         10,
@@ -694,7 +871,10 @@ def analyze_timeframe(df):
     last = data.iloc[-1]
 
     score = 0
+
     reasons = []
+
+    # EMA
 
     if (
         last["close"]
@@ -724,6 +904,8 @@ def analyze_timeframe(df):
             "EMA bearish"
         )
 
+    # Supertrend
+
     if last["st"] == 1:
 
         score += 1
@@ -739,6 +921,8 @@ def analyze_timeframe(df):
         reasons.append(
             "Supertrend bearish"
         )
+
+    # RSI
 
     if last["rsi"] >= 55:
 
@@ -759,16 +943,39 @@ def analyze_timeframe(df):
         )
 
     return {
-        "score": int(score),
+
+        "score":
+            int(score),
 
         "close":
-            float(last["close"]),
+            float(
+                last["close"]
+            ),
+
+        "ema20":
+            float(
+                last["ema20"]
+            ),
+
+        "ema50":
+            float(
+                last["ema50"]
+            ),
 
         "rsi":
-            float(last["rsi"]),
+            float(
+                last["rsi"]
+            ),
+
+        "supertrend":
+            int(
+                last["st"]
+            ),
 
         "candle_time":
-            last["time"].isoformat(),
+            last[
+                "time"
+            ].isoformat(),
 
         "reasons":
             reasons
@@ -776,10 +983,12 @@ def analyze_timeframe(df):
 
 
 # ============================================================
-# 5 MINUTE CONFIRMATION
+# 5M ENTRY CONFIRMATION
 # ============================================================
 
-def analyze_5m(df):
+def analyze_5m(
+    df
+):
 
     data = df.copy()
 
@@ -795,10 +1004,16 @@ def analyze_5m(df):
     )
 
     last = data.iloc[-1]
+
     previous = data.iloc[-2]
 
     bull_count = 0
     bear_count = 0
+
+    bull_reasons = []
+    bear_reasons = []
+
+    # EMA
 
     if (
         last["close"]
@@ -808,7 +1023,11 @@ def analyze_5m(df):
 
         bull_count += 1
 
-    if (
+        bull_reasons.append(
+            "above EMA20"
+        )
+
+    elif (
         last["close"]
         <
         last["ema20"]
@@ -816,13 +1035,29 @@ def analyze_5m(df):
 
         bear_count += 1
 
+        bear_reasons.append(
+            "below EMA20"
+        )
+
+    # Supertrend
+
     if last["st"] == 1:
 
         bull_count += 1
 
+        bull_reasons.append(
+            "Supertrend bullish"
+        )
+
     else:
 
         bear_count += 1
+
+        bear_reasons.append(
+            "Supertrend bearish"
+        )
+
+    # Previous candle break
 
     if (
         last["close"]
@@ -832,6 +1067,10 @@ def analyze_5m(df):
 
         bull_count += 1
 
+        bull_reasons.append(
+            "broke previous high"
+        )
+
     if (
         last["close"]
         <
@@ -839,6 +1078,10 @@ def analyze_5m(df):
     ):
 
         bear_count += 1
+
+        bear_reasons.append(
+            "broke previous low"
+        )
 
     return {
 
@@ -854,8 +1097,16 @@ def analyze_5m(df):
         "bear_count":
             bear_count,
 
+        "bull_reasons":
+            bull_reasons,
+
+        "bear_reasons":
+            bear_reasons,
+
         "candle_time":
-            last["time"].isoformat()
+            last[
+                "time"
+            ].isoformat()
     }
 
 
@@ -967,7 +1218,7 @@ def calculate_score(
             "5M bearish confirmation"
         )
 
-    # Direction
+    # Determine direction.
 
     if (
         buy > sell
@@ -995,7 +1246,7 @@ def calculate_score(
         score = 0
         reasons = []
 
-    # Status
+    # Determine status.
 
     if score >= SIGNAL_MIN:
 
@@ -1032,7 +1283,7 @@ def calculate_score(
 
 
 # ============================================================
-# GROQ REVIEW
+# GROQ FINAL REVIEW
 # ============================================================
 
 def groq_review(
@@ -1102,7 +1353,7 @@ Do not be excessively strict.
 WATCH is allowed when a setup
 is developing.
 
-PASS when the timeframes strongly
+PASS when timeframes strongly
 conflict.
 
 Return JSON only:
@@ -1131,12 +1382,15 @@ Return JSON only:
                 {
                     "role":
                         "system",
+
                     "content":
                         "Return valid JSON only."
                 },
+
                 {
                     "role":
                         "user",
+
                     "content":
                         prompt
                 }
@@ -1205,7 +1459,9 @@ Return JSON only:
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(
+    message
+):
 
     if not TELEGRAM_BOT_TOKEN:
 
@@ -1264,12 +1520,9 @@ def scan_index(
 
     log("=" * 60)
 
-    h12_df = get_candles(
-        ws,
-        symbol,
-        720,
-        250
-    )
+    # --------------------------------------------------------
+    # 4H DATA
+    # --------------------------------------------------------
 
     h4_df = get_candles(
         ws,
@@ -1277,6 +1530,18 @@ def scan_index(
         240,
         250
     )
+
+    # --------------------------------------------------------
+    # BUILD 12H FROM 4H
+    # --------------------------------------------------------
+
+    h12_df = resample_12h(
+        h4_df
+    )
+
+    # --------------------------------------------------------
+    # OTHER TIMEFRAMES
+    # --------------------------------------------------------
 
     h1_df = get_candles(
         ws,
@@ -1299,6 +1564,10 @@ def scan_index(
         250
     )
 
+    # --------------------------------------------------------
+    # ANALYSIS
+    # --------------------------------------------------------
+
     h12 = analyze_timeframe(
         h12_df
     )
@@ -1318,6 +1587,10 @@ def scan_index(
     m5 = analyze_5m(
         m5_df
     )
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
 
     technical = calculate_score(
         h12,
@@ -1339,6 +1612,20 @@ def scan_index(
         f"{technical['sell_score']}"
     )
 
+    log(
+        f"{instrument} "
+        f"12H={h12['score']} "
+        f"4H={h4['score']} "
+        f"1H={h1['score']} "
+        f"15M={m15['score']} "
+        f"5Mbull={m5['bull_count']} "
+        f"5Mbear={m5['bear_count']}"
+    )
+
+    # --------------------------------------------------------
+    # NO SETUP
+    # --------------------------------------------------------
+
     if (
         technical["status"]
         == "PASS"
@@ -1350,6 +1637,10 @@ def scan_index(
         )
 
         return
+
+    # --------------------------------------------------------
+    # GROQ
+    # --------------------------------------------------------
 
     log(
         f"{instrument} "
@@ -1368,13 +1659,15 @@ def scan_index(
 
     log(
         f"{instrument} GROQ "
-        f"decision={ai['decision']} "
+        f"decision="
+        f"{ai['decision']} "
         f"confidence="
         f"{ai['confidence']}"
     )
 
-    # Prevent AI from reversing
-    # the technical direction.
+    # --------------------------------------------------------
+    # PREVENT AI FROM REVERSING DIRECTION
+    # --------------------------------------------------------
 
     if ai["decision"] in {
         "BUY",
@@ -1393,6 +1686,10 @@ def scan_index(
 
             return
 
+    # --------------------------------------------------------
+    # PASS
+    # --------------------------------------------------------
+
     if ai["decision"] == "PASS":
 
         log(
@@ -1401,6 +1698,10 @@ def scan_index(
         )
 
         return
+
+    # --------------------------------------------------------
+    # DUPLICATE PREVENTION
+    # --------------------------------------------------------
 
     candle_time = m5[
         "candle_time"
@@ -1412,21 +1713,30 @@ def scan_index(
     )
 
     if (
-        previous.get("decision")
+        previous.get(
+            "decision"
+        )
         ==
         ai["decision"]
         and
-        previous.get("candle_time")
+        previous.get(
+            "candle_time"
+        )
         ==
         candle_time
     ):
 
         log(
             f"{instrument} "
-            "DUPLICATE - not sending"
+            "DUPLICATE - "
+            "not sending"
         )
 
         return
+
+    # --------------------------------------------------------
+    # MESSAGE
+    # --------------------------------------------------------
 
     if ai["decision"] == "BUY":
 
@@ -1482,6 +1792,10 @@ def scan_index(
         "no auto trading."
     )
 
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
+
     send_telegram(
         message
     )
@@ -1491,6 +1805,10 @@ def scan_index(
         "TELEGRAM ALERT SENT: "
         f"{ai['decision']}"
     )
+
+    # --------------------------------------------------------
+    # SAVE STATE
+    # --------------------------------------------------------
 
     state[instrument] = {
 
@@ -1526,10 +1844,14 @@ def main():
     )
 
     log(
-        "CURRENT DERIV PUBLIC API"
+        "DERIV CURRENT PUBLIC API"
     )
 
     log("=" * 60)
+
+    # --------------------------------------------------------
+    # CHECK VARIABLES
+    # --------------------------------------------------------
 
     missing = []
 
@@ -1566,10 +1888,20 @@ def main():
 
     try:
 
+        # ----------------------------------------------------
+        # CONNECT
+        # ----------------------------------------------------
+
         ws = connect_deriv()
 
+        # ----------------------------------------------------
+        # DISCOVER SYMBOLS
+        # ----------------------------------------------------
+
         active_symbols = (
-            get_active_symbols(ws)
+            get_active_symbols(
+                ws
+            )
         )
 
         symbols = (
@@ -1578,7 +1910,15 @@ def main():
             )
         )
 
+        # ----------------------------------------------------
+        # LOAD STATE
+        # ----------------------------------------------------
+
         state = load_state()
+
+        # ----------------------------------------------------
+        # SCAN EACH INDEX
+        # ----------------------------------------------------
 
         for (
             instrument,
@@ -1613,6 +1953,10 @@ def main():
                     f"ERROR: {e}"
                 )
 
+        # ----------------------------------------------------
+        # COMPLETE
+        # ----------------------------------------------------
+
         log("")
         log(
             "SCAN COMPLETED"
@@ -1636,6 +1980,10 @@ def main():
 
                 pass
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
