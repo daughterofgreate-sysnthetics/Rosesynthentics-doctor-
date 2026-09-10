@@ -6,8 +6,9 @@ import websocket
 import pandas as pd
 import numpy as np
 
+
 # ============================================================
-# DERIV CURRENT PUBLIC WEBSOCKET
+# CONFIGURATION
 # ============================================================
 
 DERIV_WS_URL = (
@@ -15,9 +16,7 @@ DERIV_WS_URL = (
     "trading/v1/options/ws/public"
 )
 
-# ============================================================
-# ENVIRONMENT VARIABLES
-# ============================================================
+STATE_FILE = "state.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
@@ -36,38 +35,33 @@ GROQ_API_KEY = os.getenv(
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
+    "openai/gpt-oss-120b"
 )
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-STATE_FILE = "state.json"
 
 WATCH_MIN = 5
 SIGNAL_MIN = 7
 
+
 TARGETS = {
     "CRASH 1000": [
         "crash 1000",
-        "crash1000",
+        "crash1000"
     ],
 
     "BOOM 1000": [
         "boom 1000",
-        "boom1000",
+        "boom1000"
     ],
 
     "CRASH 500": [
         "crash 500",
-        "crash500",
-    ],
+        "crash500"
+    ]
 }
 
 
 # ============================================================
-# LOG
+# LOGGING
 # ============================================================
 
 def log(message):
@@ -82,9 +76,7 @@ def load_state():
 
     try:
 
-        if not os.path.exists(
-            STATE_FILE
-        ):
+        if not os.path.exists(STATE_FILE):
             return {}
 
         with open(
@@ -134,8 +126,7 @@ def save_state(state):
 def connect_deriv():
 
     log(
-        "Connecting to current "
-        "Deriv public API..."
+        "Connecting to Deriv..."
     )
 
     ws = websocket.create_connection(
@@ -183,18 +174,16 @@ def deriv_request(
 
         data = json.loads(raw)
 
-        if (
-            data.get("error")
-            or data.get("errors")
-        ):
-
-            error = (
-                data.get("error")
-                or data.get("errors")
-            )
+        if data.get("error"):
 
             raise RuntimeError(
-                str(error)
+                str(data["error"])
+            )
+
+        if data.get("errors"):
+
+            raise RuntimeError(
+                str(data["errors"])
             )
 
         if (
@@ -203,16 +192,6 @@ def deriv_request(
             data.get("req_id")
             == request_id
         ):
-
-            return data
-
-        if data.get(
-            "msg_type"
-        ) in {
-            "active_symbols",
-            "candles",
-            "history"
-        }:
 
             return data
 
@@ -228,8 +207,7 @@ def deriv_request(
 def get_active_symbols(ws):
 
     log(
-        "Requesting Deriv "
-        "active symbols..."
+        "Requesting active symbols..."
     )
 
     response = deriv_request(
@@ -248,14 +226,13 @@ def get_active_symbols(ws):
     if not symbols:
 
         raise RuntimeError(
-            "No active symbols returned: "
+            "Deriv returned no active symbols: "
             f"{response}"
         )
 
     log(
-        "Deriv returned "
-        f"{len(symbols)} "
-        "active symbols."
+        f"Deriv returned "
+        f"{len(symbols)} active symbols."
     )
 
     return symbols
@@ -301,9 +278,7 @@ def discover_symbols(
 
     results = {}
 
-    for target, aliases in (
-        TARGETS.items()
-    ):
+    for target, aliases in TARGETS.items():
 
         found = None
 
@@ -350,8 +325,7 @@ def discover_symbols(
         else:
 
             log(
-                f"{target} -> "
-                "NOT FOUND"
+                f"{target} -> NOT FOUND"
             )
 
     return results
@@ -368,15 +342,11 @@ def get_candles(
     count=250
 ):
 
-    granularity = (
-        minutes * 60
-    )
-
     supported = {
         5: 300,
         15: 900,
         60: 3600,
-        240: 14400,
+        240: 14400
     }
 
     if minutes not in supported:
@@ -391,13 +361,12 @@ def get_candles(
     ]
 
     req_id = (
-        int(
-            time.time() * 1000
-        )
+        int(time.time() * 1000)
         % 1000000000
     )
 
     payload = {
+
         "ticks_history":
             symbol,
 
@@ -451,9 +420,7 @@ def get_candles(
                     "time":
                         pd.to_datetime(
                             int(
-                                candle[
-                                    "epoch"
-                                ]
+                                candle["epoch"]
                             ),
                             unit="s",
                             utc=True
@@ -482,28 +449,23 @@ def get_candles(
             )
 
         except Exception:
+
             continue
 
     if not rows:
 
         raise RuntimeError(
-            f"Could not parse "
-            f"candles for {symbol}"
+            f"Could not parse candles "
+            f"for {symbol}"
         )
 
-    df = pd.DataFrame(
-        rows
-    )
+    df = pd.DataFrame(rows)
 
     df = (
         df
         .sort_values("time")
-        .drop_duplicates(
-            "time"
-        )
-        .reset_index(
-            drop=True
-        )
+        .drop_duplicates("time")
+        .reset_index(drop=True)
     )
 
     # Remove current incomplete candle.
@@ -512,26 +474,19 @@ def get_candles(
         tz="UTC"
     )
 
-    current_start = (
-        now.floor(
-            f"{minutes}min"
-        )
+    current_start = now.floor(
+        f"{minutes}min"
     )
 
     df = df[
-        df["time"]
-        <
-        current_start
-    ].reset_index(
-        drop=True
-    )
+        df["time"] < current_start
+    ].reset_index(drop=True)
 
     if len(df) < 60:
 
         raise RuntimeError(
-            f"Only {len(df)} "
-            f"completed candles "
-            f"for {symbol} "
+            f"Only {len(df)} completed "
+            f"candles for {symbol} "
             f"{minutes}m"
         )
 
@@ -542,9 +497,7 @@ def get_candles(
 # BUILD 12H FROM 4H
 # ============================================================
 
-def resample_12h(
-    df
-):
+def resample_12h(df):
 
     data = df.copy()
 
@@ -575,6 +528,30 @@ def resample_12h(
     result = result.dropna()
 
     result = result.reset_index()
+
+    # Remove the currently forming 12H candle.
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    current_12h_start = (
+        now.normalize()
+        +
+        pd.Timedelta(
+            hours=12
+            if now.hour >= 12
+            else 0
+        )
+    )
+
+    result = result[
+        result["time"]
+        <
+        current_12h_start
+    ].reset_index(
+        drop=True
+    )
 
     if len(result) < 60:
 
@@ -649,9 +626,7 @@ def rsi(
         )
     )
 
-    return result.fillna(
-        50
-    )
+    return result.fillna(50)
 
 
 # ============================================================
@@ -692,9 +667,7 @@ def atr(
             tr3
         ],
         axis=1
-    ).max(
-        axis=1
-    )
+    ).max(axis=1)
 
     return true_range.ewm(
         alpha=1 / length,
@@ -739,13 +712,9 @@ def supertrend(
         atr_value
     )
 
-    upper = (
-        upper_basic.copy()
-    )
+    upper = upper_basic.copy()
 
-    lower = (
-        lower_basic.copy()
-    )
+    lower = lower_basic.copy()
 
     direction = pd.Series(
         1,
@@ -798,10 +767,7 @@ def supertrend(
                 upper.iloc[i - 1]
             )
 
-        if (
-            direction.iloc[i - 1]
-            == -1
-        ):
+        if direction.iloc[i - 1] == -1:
 
             if (
                 df["close"].iloc[i]
@@ -836,9 +802,7 @@ def supertrend(
 # TIMEFRAME ANALYSIS
 # ============================================================
 
-def analyze_timeframe(
-    df
-):
+def analyze_timeframe(df):
 
     data = df.copy()
 
@@ -948,34 +912,22 @@ def analyze_timeframe(
             int(score),
 
         "close":
-            float(
-                last["close"]
-            ),
+            float(last["close"]),
 
         "ema20":
-            float(
-                last["ema20"]
-            ),
+            float(last["ema20"]),
 
         "ema50":
-            float(
-                last["ema50"]
-            ),
+            float(last["ema50"]),
 
         "rsi":
-            float(
-                last["rsi"]
-            ),
+            float(last["rsi"]),
 
         "supertrend":
-            int(
-                last["st"]
-            ),
+            int(last["st"]),
 
         "candle_time":
-            last[
-                "time"
-            ].isoformat(),
+            last["time"].isoformat(),
 
         "reasons":
             reasons
@@ -983,12 +935,10 @@ def analyze_timeframe(
 
 
 # ============================================================
-# 5M ENTRY CONFIRMATION
+# 5M CONFIRMATION
 # ============================================================
 
-def analyze_5m(
-    df
-):
+def analyze_5m(df):
 
     data = df.copy()
 
@@ -1015,11 +965,7 @@ def analyze_5m(
 
     # EMA
 
-    if (
-        last["close"]
-        >
-        last["ema20"]
-    ):
+    if last["close"] > last["ema20"]:
 
         bull_count += 1
 
@@ -1027,11 +973,7 @@ def analyze_5m(
             "above EMA20"
         )
 
-    elif (
-        last["close"]
-        <
-        last["ema20"]
-    ):
+    elif last["close"] < last["ema20"]:
 
         bear_count += 1
 
@@ -1057,13 +999,9 @@ def analyze_5m(
             "Supertrend bearish"
         )
 
-    # Previous candle break
+    # Breakout
 
-    if (
-        last["close"]
-        >
-        previous["high"]
-    ):
+    if last["close"] > previous["high"]:
 
         bull_count += 1
 
@@ -1071,11 +1009,7 @@ def analyze_5m(
             "broke previous high"
         )
 
-    if (
-        last["close"]
-        <
-        previous["low"]
-    ):
+    if last["close"] < previous["low"]:
 
         bear_count += 1
 
@@ -1104,9 +1038,7 @@ def analyze_5m(
             bear_reasons,
 
         "candle_time":
-            last[
-                "time"
-            ].isoformat()
+            last["time"].isoformat()
     }
 
 
@@ -1128,7 +1060,7 @@ def calculate_score(
     buy_reasons = []
     sell_reasons = []
 
-    # 12H = 1 point
+    # 12H = 1
 
     if h12["score"] > 0:
 
@@ -1146,7 +1078,7 @@ def calculate_score(
             "12H bearish"
         )
 
-    # 4H = 1 point
+    # 4H = 1
 
     if h4["score"] > 0:
 
@@ -1164,7 +1096,7 @@ def calculate_score(
             "4H bearish"
         )
 
-    # 1H = 2 points
+    # 1H = 2
 
     if h1["score"] > 0:
 
@@ -1182,7 +1114,7 @@ def calculate_score(
             "1H bearish"
         )
 
-    # 15M = 3 points
+    # 15M = 3
 
     if m15["score"] > 0:
 
@@ -1200,7 +1132,7 @@ def calculate_score(
             "15M bearish setup"
         )
 
-    # 5M = 2 points
+    # 5M = 2
 
     if m5["bullish"]:
 
@@ -1218,7 +1150,7 @@ def calculate_score(
             "5M bearish confirmation"
         )
 
-    # Determine direction.
+    # Direction
 
     if (
         buy > sell
@@ -1246,7 +1178,7 @@ def calculate_score(
         score = 0
         reasons = []
 
-    # Determine status.
+    # Status
 
     if score >= SIGNAL_MIN:
 
@@ -1283,7 +1215,76 @@ def calculate_score(
 
 
 # ============================================================
-# GROQ FINAL REVIEW
+# EXTRACT JSON SAFELY
+# ============================================================
+
+def extract_json_object(text):
+
+    if not text:
+
+        return None
+
+    text = str(text).strip()
+
+    # Remove markdown fences.
+
+    text = text.replace(
+        "```json",
+        ""
+    )
+
+    text = text.replace(
+        "```JSON",
+        ""
+    )
+
+    text = text.replace(
+        "```",
+        ""
+    )
+
+    text = text.strip()
+
+    # Direct JSON.
+
+    try:
+
+        return json.loads(text)
+
+    except Exception:
+
+        pass
+
+    # Find first JSON object.
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if (
+        start >= 0
+        and
+        end > start
+    ):
+
+        candidate = text[
+            start:end + 1
+        ]
+
+        try:
+
+            return json.loads(
+                candidate
+            )
+
+        except Exception:
+
+            pass
+
+    return None
+
+
+# ============================================================
+# GROQ REVIEW
 # ============================================================
 
 def groq_review(
@@ -1310,16 +1311,15 @@ def groq_review(
 
     prompt = f"""
 You are the final technical reviewer
-for a synthetic-indices scanner.
+for a synthetic indices signal scanner.
 
-This system is analysis only.
-Do NOT place trades.
-Do NOT invent data.
+This is analysis only.
+Never place trades.
 
 Instrument:
 {instrument}
 
-Technical proposal:
+Technical score:
 {json.dumps(technical)}
 
 12H:
@@ -1339,93 +1339,153 @@ Technical proposal:
 
 Rules:
 
-If technical direction is BUY:
-you may return BUY, WATCH or PASS.
+1. If technical direction is BUY,
+you may return BUY, WATCH, or PASS.
 
-If technical direction is SELL:
-you may return SELL, WATCH or PASS.
+2. If technical direction is SELL,
+you may return SELL, WATCH, or PASS.
 
-If technical direction is NONE:
+3. If technical direction is NONE,
 return PASS.
 
-Do not be excessively strict.
+4. Do not reverse BUY into SELL.
 
-WATCH is allowed when a setup
-is developing.
+5. Do not reverse SELL into BUY.
 
-PASS when timeframes strongly
-conflict.
+6. Do not be excessively strict.
 
-Return JSON only:
+7. WATCH is acceptable when a setup
+is developing but is not yet strong enough.
+
+Return ONLY this JSON object:
 
 {{
-  "decision":
-    "BUY|SELL|WATCH|PASS",
-
-  "confidence":
-    0,
-
-  "reason":
-    "short explanation"
+  "decision": "BUY",
+  "confidence": 75,
+  "reason": "short explanation"
 }}
+
+The decision must be exactly one of:
+BUY, SELL, WATCH, PASS.
+
+Confidence must be a number from 0 to 100.
 """
 
-    response = (
-        client
-        .chat
-        .completions
-        .create(
-            model=GROQ_MODEL,
-            temperature=0.1,
-            max_tokens=200,
-            messages=[
-                {
-                    "role":
-                        "system",
+    try:
 
-                    "content":
-                        "Return valid JSON only."
-                },
+        response = (
+            client
+            .chat
+            .completions
+            .create(
+                model=GROQ_MODEL,
 
-                {
-                    "role":
-                        "user",
+                messages=[
+                    {
+                        "role": "system",
+                        "content":
+                            "You are a technical "
+                            "analysis assistant. "
+                            "Return only valid JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
 
-                    "content":
-                        prompt
+                temperature=0.1,
+
+                max_tokens=300,
+
+                response_format={
+                    "type": "json_object"
                 }
-            ]
+            )
         )
-    )
 
-    text = (
-        response
-        .choices[0]
-        .message
-        .content
-        .strip()
-    )
+    except Exception as e:
 
-    text = text.replace(
-        "```json",
-        ""
-    )
+        log(
+            f"GROQ API ERROR: {e}"
+        )
 
-    text = text.replace(
-        "```",
-        ""
-    ).strip()
+        # Do not crash scanner.
 
-    result = json.loads(
+        return {
+            "decision": "PASS",
+            "confidence": 0,
+            "reason":
+                "Groq API error"
+        }
+
+    # --------------------------------------------------------
+    # GET RESPONSE TEXT
+    # --------------------------------------------------------
+
+    try:
+
+        message = (
+            response
+            .choices[0]
+            .message
+        )
+
+        text = (
+            message.content
+            or ""
+        )
+
+    except Exception as e:
+
+        log(
+            f"GROQ RESPONSE ERROR: {e}"
+        )
+
+        return {
+            "decision": "PASS",
+            "confidence": 0,
+            "reason":
+                "Empty Groq response"
+        }
+
+    # --------------------------------------------------------
+    # PARSE JSON
+    # --------------------------------------------------------
+
+    result = extract_json_object(
         text
     )
+
+    if result is None:
+
+        log(
+            "GROQ returned invalid "
+            "or empty JSON."
+        )
+
+        log(
+            f"GROQ RAW RESPONSE: "
+            f"{repr(text[:500])}"
+        )
+
+        return {
+            "decision": "PASS",
+            "confidence": 0,
+            "reason":
+                "Groq returned invalid JSON"
+        }
+
+    # --------------------------------------------------------
+    # VALIDATE
+    # --------------------------------------------------------
 
     decision = str(
         result.get(
             "decision",
             "PASS"
         )
-    ).upper()
+    ).upper().strip()
 
     if decision not in {
         "BUY",
@@ -1436,22 +1496,50 @@ Return JSON only:
 
         decision = "PASS"
 
+    try:
+
+        confidence = float(
+            result.get(
+                "confidence",
+                0
+            )
+        )
+
+    except Exception:
+
+        confidence = 0
+
+    confidence = max(
+        0,
+        min(
+            100,
+            confidence
+        )
+    )
+
+    reason = str(
+        result.get(
+            "reason",
+            ""
+        )
+    ).strip()
+
+    if not reason:
+
+        reason = (
+            "No AI explanation returned."
+        )
+
     return {
 
         "decision":
             decision,
 
         "confidence":
-            result.get(
-                "confidence",
-                0
-            ),
+            confidence,
 
         "reason":
-            result.get(
-                "reason",
-                ""
-            )
+            reason
     }
 
 
@@ -1521,18 +1609,18 @@ def scan_index(
     log("=" * 60)
 
     # --------------------------------------------------------
-    # 4H DATA
+    # 4H
     # --------------------------------------------------------
 
     h4_df = get_candles(
         ws,
         symbol,
         240,
-        250
+        300
     )
 
     # --------------------------------------------------------
-    # BUILD 12H FROM 4H
+    # 12H FROM 4H
     # --------------------------------------------------------
 
     h12_df = resample_12h(
@@ -1540,7 +1628,7 @@ def scan_index(
     )
 
     # --------------------------------------------------------
-    # OTHER TIMEFRAMES
+    # 1H
     # --------------------------------------------------------
 
     h1_df = get_candles(
@@ -1550,12 +1638,20 @@ def scan_index(
         250
     )
 
+    # --------------------------------------------------------
+    # 15M
+    # --------------------------------------------------------
+
     m15_df = get_candles(
         ws,
         symbol,
         15,
         250
     )
+
+    # --------------------------------------------------------
+    # 5M
+    # --------------------------------------------------------
 
     m5_df = get_candles(
         ws,
@@ -1565,7 +1661,7 @@ def scan_index(
     )
 
     # --------------------------------------------------------
-    # ANALYSIS
+    # ANALYZE
     # --------------------------------------------------------
 
     h12 = analyze_timeframe(
@@ -1602,13 +1698,13 @@ def scan_index(
 
     log(
         f"{instrument} "
-        f"direction="
+        f"DIRECTION="
         f"{technical['direction']} "
-        f"status="
+        f"STATUS="
         f"{technical['status']} "
-        f"buy="
+        f"BUY="
         f"{technical['buy_score']} "
-        f"sell="
+        f"SELL="
         f"{technical['sell_score']}"
     )
 
@@ -1618,18 +1714,15 @@ def scan_index(
         f"4H={h4['score']} "
         f"1H={h1['score']} "
         f"15M={m15['score']} "
-        f"5Mbull={m5['bull_count']} "
-        f"5Mbear={m5['bear_count']}"
+        f"5M_BULL={m5['bull_count']} "
+        f"5M_BEAR={m5['bear_count']}"
     )
 
     # --------------------------------------------------------
-    # NO SETUP
+    # NO TECHNICAL SETUP
     # --------------------------------------------------------
 
-    if (
-        technical["status"]
-        == "PASS"
-    ):
+    if technical["status"] == "PASS":
 
         log(
             f"{instrument} "
@@ -1658,36 +1751,15 @@ def scan_index(
     )
 
     log(
-        f"{instrument} GROQ "
-        f"decision="
+        f"{instrument} "
+        f"GROQ="
         f"{ai['decision']} "
-        f"confidence="
+        f"CONFIDENCE="
         f"{ai['confidence']}"
     )
 
     # --------------------------------------------------------
-    # PREVENT AI FROM REVERSING DIRECTION
-    # --------------------------------------------------------
-
-    if ai["decision"] in {
-        "BUY",
-        "SELL"
-    }:
-
-        if (
-            ai["decision"]
-            != technical["direction"]
-        ):
-
-            log(
-                f"{instrument} "
-                "AI direction rejected."
-            )
-
-            return
-
-    # --------------------------------------------------------
-    # PASS
+    # GROQ PASS
     # --------------------------------------------------------
 
     if ai["decision"] == "PASS":
@@ -1700,12 +1772,36 @@ def scan_index(
         return
 
     # --------------------------------------------------------
+    # PREVENT DIRECTION REVERSAL
+    # --------------------------------------------------------
+
+    if ai["decision"] in {
+        "BUY",
+        "SELL"
+    }:
+
+        if (
+            technical["direction"]
+            !=
+            ai["decision"]
+        ):
+
+            log(
+                f"{instrument} "
+                "AI direction rejected "
+                "because it conflicts "
+                "with technical direction."
+            )
+
+            return
+
+    # --------------------------------------------------------
     # DUPLICATE PREVENTION
     # --------------------------------------------------------
 
-    candle_time = m5[
-        "candle_time"
-    ]
+    candle_time = (
+        m5["candle_time"]
+    )
 
     previous = state.get(
         instrument,
@@ -1713,15 +1809,11 @@ def scan_index(
     )
 
     if (
-        previous.get(
-            "decision"
-        )
+        previous.get("decision")
         ==
         ai["decision"]
         and
-        previous.get(
-            "candle_time"
-        )
+        previous.get("candle_time")
         ==
         candle_time
     ):
@@ -1729,13 +1821,13 @@ def scan_index(
         log(
             f"{instrument} "
             "DUPLICATE - "
-            "not sending"
+            "not sending Telegram."
         )
 
         return
 
     # --------------------------------------------------------
-    # MESSAGE
+    # ICON
     # --------------------------------------------------------
 
     if ai["decision"] == "BUY":
@@ -1750,18 +1842,22 @@ def scan_index(
 
         icon = "🟡"
 
+    # --------------------------------------------------------
+    # TELEGRAM MESSAGE
+    # --------------------------------------------------------
+
     message = (
         f"{icon} "
         f"{ai['decision']} — "
         f"{instrument}\n\n"
 
-        f"Score: "
+        f"Technical Score: "
         f"{technical['score']}\n"
 
-        f"Buy score: "
+        f"Buy Score: "
         f"{technical['buy_score']}\n"
 
-        f"Sell score: "
+        f"Sell Score: "
         f"{technical['sell_score']}\n\n"
 
         f"12H: "
@@ -1782,10 +1878,10 @@ def scan_index(
         f"5M Bear: "
         f"{m5['bear_count']}\n\n"
 
-        f"AI confidence: "
-        f"{ai['confidence']}\n\n"
+        f"AI Confidence: "
+        f"{ai['confidence']:.0f}%\n\n"
 
-        f"AI review: "
+        f"AI Review:\n"
         f"{ai['reason']}\n\n"
 
         "Analysis only — "
@@ -1793,16 +1889,27 @@ def scan_index(
     )
 
     # --------------------------------------------------------
-    # SEND
+    # SEND TELEGRAM
     # --------------------------------------------------------
 
-    send_telegram(
-        message
-    )
+    try:
+
+        send_telegram(
+            message
+        )
+
+    except Exception as e:
+
+        log(
+            f"{instrument} "
+            f"TELEGRAM ERROR: {e}"
+        )
+
+        return
 
     log(
         f"{instrument} "
-        "TELEGRAM ALERT SENT: "
+        f"TELEGRAM ALERT SENT: "
         f"{ai['decision']}"
     )
 
@@ -1839,12 +1946,11 @@ def main():
     log("=" * 60)
 
     log(
-        "SYNTHETIC INDICES "
-        "SCANNER"
+        "SYNTHETIC INDICES SIGNAL SCANNER"
     )
 
     log(
-        "DERIV CURRENT PUBLIC API"
+        "Deriv + Multi-Timeframe + Groq"
     )
 
     log("=" * 60)
@@ -1875,14 +1981,19 @@ def main():
 
     if missing:
 
-        for item in missing:
+        for variable in missing:
 
             log(
                 f"ERROR: "
-                f"{item} missing"
+                f"{variable} missing"
             )
 
         return
+
+    log(
+        f"Groq model: "
+        f"{GROQ_MODEL}"
+    )
 
     ws = None
 
@@ -1895,7 +2006,7 @@ def main():
         ws = connect_deriv()
 
         # ----------------------------------------------------
-        # DISCOVER SYMBOLS
+        # ACTIVE SYMBOLS
         # ----------------------------------------------------
 
         active_symbols = (
@@ -1904,6 +2015,10 @@ def main():
             )
         )
 
+        # ----------------------------------------------------
+        # FIND TARGETS
+        # ----------------------------------------------------
+
         symbols = (
             discover_symbols(
                 active_symbols
@@ -1911,13 +2026,13 @@ def main():
         )
 
         # ----------------------------------------------------
-        # LOAD STATE
+        # STATE
         # ----------------------------------------------------
 
         state = load_state()
 
         # ----------------------------------------------------
-        # SCAN EACH INDEX
+        # SCAN
         # ----------------------------------------------------
 
         for (
@@ -1954,7 +2069,7 @@ def main():
                 )
 
         # ----------------------------------------------------
-        # COMPLETE
+        # DONE
         # ----------------------------------------------------
 
         log("")
@@ -1986,4 +2101,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
