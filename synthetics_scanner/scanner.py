@@ -2712,13 +2712,20 @@ def scan_one(
         name
     )
 
-    groq_result = groq_review(
-        name,
-        snaps,
-        0,
-        score if proposal == "SELL" else 0,
-        structure
-    )
+    if proposal == "BUY":
+    buy_score = score
+    sell_score = 0
+else:
+    buy_score = 0
+    sell_score = score
+
+groq_result = groq_review(
+    name,
+    snaps,
+    buy_score,
+    sell_score,
+    structure
+)
 
     ai_decision = str(
         groq_result.get(
