@@ -181,6 +181,12 @@ PULLBACK_MIN_ATR = 0.20
 PULLBACK_MAX_ATR = 1.50
 
 
+# Maximum age of a spike that can still create
+# a reversal signal.
+
+MAX_SPIKE_AGE_BARS = 12
+
+
 # ============================================================
 # STATE
 # ============================================================
@@ -467,6 +473,8 @@ def get_active_symbols():
 
                 break
 
+            matched = False
+
             for alias in aliases:
 
                 normalized_alias = (
@@ -479,7 +487,13 @@ def get_active_symbols():
 
                     found[target] = symbol
 
+                    matched = True
+
                     break
+
+            if matched:
+
+                break
 
     return found
 
@@ -1264,8 +1278,6 @@ def detect_recent_spike(
             )
         }
 
-        # Prefer the newest valid spike.
-
         if (
             best is None
             or
@@ -1285,28 +1297,6 @@ def detect_spike_pullback_reversal(
     df,
     direction
 ):
-
-    """
-    CRASH:
-
-        RED/DOWN SPIKE
-              ↓
-          PULLBACK ↑
-              ↓
-        SELLER RETURN
-              ↓
-             SELL
-
-    BOOM:
-
-        GREEN/UP SPIKE
-              ↑
-          PULLBACK ↓
-              ↑
-        BUYER RETURN
-              ↑
-             BUY
-    """
 
     result = {
 
@@ -1361,6 +1351,24 @@ def detect_spike_pullback_reversal(
     )
 
     # --------------------------------------------------------
+    # REJECT STALE SPIKES
+    # --------------------------------------------------------
+
+    if (
+        result["spike_age"]
+        >
+        MAX_SPIKE_AGE_BARS
+    ):
+
+        result["spike"] = False
+
+        result["phase"] = (
+            "SPIKE_TOO_OLD"
+        )
+
+        return result
+
+    # --------------------------------------------------------
     # Get candles after spike
     # --------------------------------------------------------
 
@@ -1401,7 +1409,6 @@ def detect_spike_pullback_reversal(
 
     if direction == "CRASH":
 
-        # After a downward spike, price must move upward.
         highest_after = float(
             after["high"].max()
         )
@@ -1510,7 +1517,6 @@ def detect_spike_pullback_reversal(
 
     if direction == "BOOM":
 
-        # After an upward spike, price must move downward.
         lowest_after = float(
             after["low"].min()
         )
@@ -2712,20 +2718,29 @@ def scan_one(
         name
     )
 
-    if proposal == "BUY":
-    buy_score = score
-    sell_score = 0
-else:
-    buy_score = 0
-    sell_score = score
+    # IMPORTANT:
+    # BUY setup -> buy gets the score
+    # SELL setup -> sell gets the score
 
-groq_result = groq_review(
-    name,
-    snaps,
-    buy_score,
-    sell_score,
-    structure
-)
+    if proposal == "BUY":
+
+        buy_score = score
+
+        sell_score = 0
+
+    else:
+
+        buy_score = 0
+
+        sell_score = score
+
+    groq_result = groq_review(
+        name,
+        snaps,
+        buy_score,
+        sell_score,
+        structure
+    )
 
     ai_decision = str(
         groq_result.get(
@@ -2744,6 +2759,58 @@ groq_result = groq_review(
         ai_decision,
         confidence
     )
+
+    # --------------------------------------------------------
+    # HARD AI DIRECTION PROTECTION
+    # --------------------------------------------------------
+
+    if (
+        synthetic_type == "CRASH"
+        and
+        ai_decision != "SELL"
+        and
+        ai_decision not in (
+            "WATCH",
+            "PASS"
+        )
+    ):
+
+        log.warning(
+            (
+                "%s BLOCKED %s: "
+                "CRASH can only SELL"
+            ),
+
+            name,
+
+            ai_decision
+        )
+
+        return
+
+    if (
+        synthetic_type == "BOOM"
+        and
+        ai_decision != "BUY"
+        and
+        ai_decision not in (
+            "WATCH",
+            "PASS"
+        )
+    ):
+
+        log.warning(
+            (
+                "%s BLOCKED %s: "
+                "BOOM can only BUY"
+            ),
+
+            name,
+
+            ai_decision
+        )
+
+        return
 
     # --------------------------------------------------------
     # DUPLICATE PREVENTION
@@ -2890,7 +2957,7 @@ groq_result = groq_review(
             return
 
         # ====================================================
-        # SEND
+        # SEND SIGNAL
         # ====================================================
 
         text = build_signal_message(
@@ -2954,7 +3021,12 @@ def run_scan():
     )
 
     log.info(
-        "Targets: Crash 1000, Boom 1000, Crash 500"
+        (
+            "Targets: CRASH 300, CRASH 500, "
+            "CRASH 600, CRASH 900, CRASH 1000, "
+            "BOOM 300, BOOM 500, BOOM 600, "
+            "BOOM 900, BOOM 1000"
+        )
     )
 
     log.info(
@@ -2984,8 +3056,29 @@ def run_scan():
     )
 
     log.info(
+        "Watch threshold: %d",
+        WATCH_MIN
+    )
+
+    log.info(
         "Spike ATR threshold: %.2f",
         SPIKE_ATR_MULT
+    )
+
+    log.info(
+        "Spike lookback: %d candles",
+        SPIKE_LOOKBACK
+    )
+
+    log.info(
+        "Pullback range: %.2f - %.2f ATR",
+        PULLBACK_MIN_ATR,
+        PULLBACK_MAX_ATR
+    )
+
+    log.info(
+        "Maximum spike age: %d 5M candles",
+        MAX_SPIKE_AGE_BARS
     )
 
     log.info(
@@ -3022,9 +3115,13 @@ def run_scan():
         return
 
     log.info(
-        "Discovered symbols: %s",
+        "Discovered target symbols: %s",
         symbols
     )
+
+    # --------------------------------------------------------
+    # REPORT MISSING
+    # --------------------------------------------------------
 
     missing = [
 
@@ -3041,6 +3138,25 @@ def run_scan():
             "Could not discover: %s",
             ", ".join(missing)
         )
+
+    # --------------------------------------------------------
+    # REPORT FOUND
+    # --------------------------------------------------------
+
+    found = [
+
+        name
+
+        for name in TARGET_NAMES
+
+        if name in symbols
+    ]
+
+    log.info(
+        "Found %d/%d target indices.",
+        len(found),
+        len(TARGET_NAMES)
+    )
 
     # --------------------------------------------------------
     # SCAN TARGETS
@@ -3122,6 +3238,10 @@ def main():
 
     log.info(
         "BOOM = BUY ONLY"
+    )
+
+    log.info(
+        "10 TARGET INDICES ENABLED"
     )
 
     log.info(
