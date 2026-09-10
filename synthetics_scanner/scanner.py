@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 from datetime import datetime, timezone
 
@@ -17,8 +18,6 @@ except ImportError:
 # CONFIG
 # ============================================================
 
-# Public Deriv market-data WebSocket.
-# No trading account or trading permission is needed.
 DERIV_WS_URL = os.getenv(
     "DERIV_WS_URL",
     "wss://api.derivws.com/trading/v1/options/ws/public"
@@ -39,10 +38,21 @@ GROQ_API_KEY = os.getenv(
     ""
 )
 
-# Current Groq model.
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "openai/gpt-oss-120b"
+)
+
+# ============================================================
+# SCAN INTERVAL
+# ============================================================
+
+# 300 seconds = 5 minutes
+SCAN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "300"
+    )
 )
 
 
@@ -66,8 +76,13 @@ TARGET_NAMES = {
 }
 
 
+# ============================================================
+# DERIV TIMEFRAMES
+# ============================================================
+
 # Deriv supports these candle granularities.
-# 12H is NOT requested directly.
+# 12H is constructed from 3 completed 4H candles.
+
 TIMEFRAMES = {
     "4H": 14400,
     "1H": 3600,
@@ -81,6 +96,7 @@ TIMEFRAMES = {
 # ============================================================
 
 # Deliberately not too strict.
+
 SIGNAL_MIN = 7
 WATCH_MIN = 5
 
@@ -131,19 +147,24 @@ log = logging.getLogger(
 # ============================================================
 
 def load_state():
+
     try:
+
         with open(
             STATE_FILE,
             "r",
             encoding="utf-8"
         ) as f:
+
             return json.load(f)
 
     except Exception:
+
         return {}
 
 
 def save_state(state):
+
     temp_file = STATE_FILE + ".tmp"
 
     with open(
@@ -151,6 +172,7 @@ def save_state(state):
         "w",
         encoding="utf-8"
     ) as f:
+
         json.dump(
             state,
             f,
@@ -168,24 +190,27 @@ def save_state(state):
 # ============================================================
 
 def send_telegram(message):
+
     """
     Sends Telegram alert.
 
-    Important:
-    The bot token is NEVER printed in the logs.
+    The bot token is never printed in logs.
     """
 
     if not TELEGRAM_BOT_TOKEN:
+
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN missing"
         )
 
     if not TELEGRAM_CHAT_ID:
+
         raise RuntimeError(
             "TELEGRAM_CHAT_ID missing"
         )
 
     token = TELEGRAM_BOT_TOKEN.strip()
+
     chat_id = TELEGRAM_CHAT_ID.strip()
 
     url = (
@@ -200,6 +225,7 @@ def send_telegram(message):
     }
 
     try:
+
         response = requests.post(
             url,
             json=payload,
@@ -207,6 +233,7 @@ def send_telegram(message):
         )
 
     except Exception as e:
+
         raise RuntimeError(
             "Telegram connection error: "
             f"{e}"
@@ -215,6 +242,7 @@ def send_telegram(message):
     if not response.ok:
 
         try:
+
             details = response.json()
 
             error_code = details.get(
@@ -244,14 +272,17 @@ def send_telegram(message):
         )
 
     try:
+
         result = response.json()
 
     except Exception:
+
         raise RuntimeError(
             "Telegram returned invalid JSON."
         )
 
     if result.get("ok") is not True:
+
         raise RuntimeError(
             "Telegram API error: "
             f"{result.get('description', 'Unknown error')}"
@@ -265,6 +296,7 @@ def send_telegram(message):
 # ============================================================
 
 def deriv_request(ws, payload):
+
     """
     Send one request and wait for its response.
     """
@@ -356,6 +388,7 @@ def get_active_symbols():
         )
 
         if not symbol:
+
             continue
 
         normalized = (
@@ -400,13 +433,13 @@ def get_candles(
     granularity,
     count=250
 ):
+
     """
     Get completed OHLC candles.
 
     IMPORTANT:
-    We do NOT send subscribe=0 because the
-    current Deriv API rejects that value for
-    candle requests.
+    No subscribe=0 is sent because the current
+    Deriv API rejects that value for candle requests.
     """
 
     ws = create_connection(
@@ -506,7 +539,10 @@ def get_candles(
         )
     )
 
-    # Remove currently forming candle.
+    # --------------------------------------------------------
+    # REMOVE CURRENTLY FORMING CANDLE
+    # --------------------------------------------------------
+
     now = pd.Timestamp.now(
         tz="UTC"
     )
@@ -538,13 +574,16 @@ def get_candles(
 # ============================================================
 
 def build_12h_from_4h(df_4h):
+
     """
     Deriv does not provide 12H in the supported
     candle granularity list.
 
     Therefore:
 
-        3 x completed 4H candles = 1 x 12H candle
+        3 x completed 4H candles
+        =
+        1 x 12H candle
     """
 
     if df_4h.empty:
@@ -572,8 +611,6 @@ def build_12h_from_4h(df_4h):
         )
     )
 
-    # A completed 12H candle must contain
-    # exactly three 4H candles.
     counts = (
         df["close"]
         .resample(
@@ -972,6 +1009,7 @@ def indicator_snapshot(df):
         rsi_bias = "NEUTRAL"
 
     return {
+
         "close": current_close,
 
         "ema20": float(
@@ -1021,9 +1059,9 @@ def score_market(snaps):
     1H  = 2 points
 
     15M:
-        EMA       = 1
-        Supertrend= 1
-        RSI       = 1
+        EMA        = 1
+        Supertrend = 1
+        RSI        = 1
 
     5M:
         Supertrend = 1
@@ -1225,6 +1263,7 @@ def groq_review(
     for tf, snapshot in snaps.items():
 
         compact[tf] = {
+
             "close": round(
                 snapshot["close"],
                 8
@@ -1305,9 +1344,11 @@ Return ONLY the required JSON object.
             .chat
             .completions
             .create(
+
                 model=GROQ_MODEL,
 
                 messages=[
+
                     {
                         "role": "system",
                         "content": (
@@ -1346,6 +1387,7 @@ Return ONLY the required JSON object.
         )
 
         # Remove accidental markdown fences.
+
         if text.startswith("```"):
 
             text = (
@@ -1366,6 +1408,7 @@ Return ONLY the required JSON object.
         )
 
         # Normalize decision.
+
         decision = str(
             result.get(
                 "decision",
@@ -1414,8 +1457,11 @@ Return ONLY the required JSON object.
         ).strip()
 
         return {
+
             "decision": decision,
+
             "confidence": confidence,
+
             "reason": reason
         }
 
@@ -1427,14 +1473,17 @@ Return ONLY the required JSON object.
         )
 
         return {
+
             "decision": "PASS",
+
             "confidence": None,
+
             "reason": "Groq review failed"
         }
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# TELEGRAM SIGNAL MESSAGE
 # ============================================================
 
 def build_signal_message(
@@ -1478,23 +1527,28 @@ def build_signal_message(
         "MULTI-TIMEFRAME:",
 
         (
-            f"12H: {snaps['12H']['ema_trend']}"
+            f"12H: "
+            f"{snaps['12H']['ema_trend']}"
         ),
 
         (
-            f"4H: {snaps['4H']['ema_trend']}"
+            f"4H: "
+            f"{snaps['4H']['ema_trend']}"
         ),
 
         (
-            f"1H: {snaps['1H']['ema_trend']}"
+            f"1H: "
+            f"{snaps['1H']['ema_trend']}"
         ),
 
         (
-            f"15M: {snaps['15M']['supertrend']}"
+            f"15M: "
+            f"{snaps['15M']['supertrend']}"
         ),
 
         (
-            f"5M: {snaps['5M']['supertrend']}"
+            f"5M: "
+            f"{snaps['5M']['supertrend']}"
         ),
 
         (
@@ -1518,7 +1572,9 @@ def build_signal_message(
 
     lines.extend(
         [
+
             "",
+
             "Scanner only — "
             "no automatic trading."
         ]
@@ -1618,9 +1674,12 @@ def build_watch_message(
 
     lines.extend(
         [
+
             "",
+
             "Developing setup — "
             "not a confirmed signal.",
+
             "Scanner only — "
             "no automatic trading."
         ]
@@ -1657,7 +1716,8 @@ def scan_one(
         count=300
     )
 
-    # Build 12H from 4H.
+    # Build 12H from completed 4H.
+
     df_12h = build_12h_from_4h(
         df_4h
     )
@@ -1733,6 +1793,7 @@ def scan_one(
             "15M=%s "
             "5M=%s"
         ),
+
         name,
 
         snaps["12H"]["ema_trend"],
@@ -1758,6 +1819,7 @@ def scan_one(
     # --------------------------------------------------------
 
     proposal = None
+
     score = 0
 
     if (
@@ -1767,6 +1829,7 @@ def scan_one(
     ):
 
         proposal = "BUY"
+
         score = buy
 
     elif (
@@ -1776,6 +1839,7 @@ def scan_one(
     ):
 
         proposal = "SELL"
+
         score = sell
 
     elif (
@@ -1788,11 +1852,13 @@ def scan_one(
         if buy > sell:
 
             proposal = "BUY"
+
             score = buy
 
         else:
 
             proposal = "SELL"
+
             score = sell
 
     else:
@@ -1802,8 +1868,11 @@ def scan_one(
                 "%s NO SETUP "
                 "BUY=%d SELL=%d"
             ),
+
             name,
+
             buy,
+
             sell
         )
 
@@ -1925,7 +1994,8 @@ def scan_one(
         "SELL"
     ):
 
-        # AI must agree with the technical proposal.
+        # AI must agree with technical proposal.
+
         if ai_decision != proposal:
 
             log.info(
@@ -1935,8 +2005,11 @@ def scan_one(
                     "technical proposal %s; "
                     "no alert."
                 ),
+
                 name,
+
                 ai_decision,
+
                 proposal
             )
 
@@ -1988,17 +2061,17 @@ def scan_one(
 
 
 # ============================================================
-# MAIN
+# RUN ONE COMPLETE SCAN
 # ============================================================
 
-def main():
+def run_scan():
 
     log.info(
         "======================================"
     )
 
     log.info(
-        "Starting synthetic scanner"
+        "Starting scan cycle"
     )
 
     log.info(
@@ -2025,6 +2098,12 @@ def main():
     )
 
     log.info(
+        "Scan interval: %d seconds (%d minutes)",
+        SCAN_INTERVAL_SECONDS,
+        SCAN_INTERVAL_SECONDS // 60
+    )
+
+    log.info(
         "No automatic trading"
     )
 
@@ -2033,6 +2112,10 @@ def main():
     )
 
     state = load_state()
+
+    # --------------------------------------------------------
+    # GET SYMBOLS
+    # --------------------------------------------------------
 
     try:
 
@@ -2065,7 +2148,10 @@ def main():
             ", ".join(missing)
         )
 
-    # Only scan our three requested indices.
+    # --------------------------------------------------------
+    # SCAN OUR THREE INDICES
+    # --------------------------------------------------------
+
     for name in TARGET_NAMES:
 
         symbol = symbols.get(
@@ -2092,13 +2178,109 @@ def main():
                 e
             )
 
-    save_state(
-        state
+    # --------------------------------------------------------
+    # SAVE STATE
+    # --------------------------------------------------------
+
+    try:
+
+        save_state(
+            state
+        )
+
+    except Exception as e:
+
+        log.exception(
+            "Could not save state: %s",
+            e
+        )
+
+    log.info(
+        "Scan cycle finished."
+    )
+
+
+# ============================================================
+# MAIN — CONTINUOUS 5-MINUTE LOOP
+# ============================================================
+
+def main():
+
+    log.info(
+        "======================================"
     )
 
     log.info(
-        "Scanner finished."
+        "SYNTHETIC SCANNER STARTING"
     )
+
+    log.info(
+        "Continuous scanning ENABLED"
+    )
+
+    log.info(
+        "Scan interval: %d seconds (%d minutes)",
+        SCAN_INTERVAL_SECONDS,
+        SCAN_INTERVAL_SECONDS // 60
+    )
+
+    log.info(
+        "======================================"
+    )
+
+    while True:
+
+        cycle_started = time.time()
+
+        try:
+
+            run_scan()
+
+        except Exception as e:
+
+            log.exception(
+                "Unexpected scanner error: %s",
+                e
+            )
+
+        elapsed = (
+            time.time()
+            -
+            cycle_started
+        )
+
+        wait_seconds = max(
+            1,
+            SCAN_INTERVAL_SECONDS
+        )
+
+        log.info(
+            (
+                "Next scan in %d seconds "
+                "(%d minutes). "
+                "Current cycle took %.1f seconds."
+            ),
+
+            wait_seconds,
+
+            wait_seconds // 60,
+
+            elapsed
+        )
+
+        try:
+
+            time.sleep(
+                wait_seconds
+            )
+
+        except KeyboardInterrupt:
+
+            log.info(
+                "Scanner stopped."
+            )
+
+            break
 
 
 # ============================================================
