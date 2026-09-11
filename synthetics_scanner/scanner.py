@@ -1,23 +1,20 @@
 # ============================================================
-# DERIV CRASH / BOOM PULLBACK SCANNER
-# VERSION: 2026-09-BALANCED-PULLBACK-V2
+# DERIV SYNTHETIC PULLBACK SCANNER
+# Version: 2026-09-BALANCED-PULLBACK-V3
 #
-# IMPORTANT:
-# - SCANNER ONLY
-# - NO AUTOMATIC TRADING
-# - Telegram alerts only
-#
-# CRASH  -> SELL setups only
-# BOOM   -> BUY setups only
+# PURPOSE:
+#   CRASH  -> SELL only
+#   BOOM   -> BUY only
 #
 # Strategy:
-#   Spike -> Pullback -> Weakening -> Controlled reversal
+#   1. Detect a genuine spike
+#   2. Wait for price to pull back
+#   3. Make sure the pullback is not another huge continuation
+#   4. Wait for a controlled reversal on 5M
+#   5. Confirm higher-timeframe direction
+#   6. Send Telegram alert
 #
-# Higher timeframe:
-#   12H = broad regime filter
-#   4H/1H/15M = 2-of-3 confirmation
-#   5M = entry trigger
-#
+# NO AUTO TRADING.
 # ============================================================
 
 import os
@@ -27,9 +24,9 @@ import math
 import traceback
 from datetime import datetime, timezone
 
-import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
 
 try:
     import websocket
@@ -41,29 +38,52 @@ except ImportError:
 # VERSION
 # ============================================================
 
-VERSION = "2026-09-BALANCED-PULLBACK-V2"
+VERSION = "2026-09-BALANCED-PULLBACK-V3"
+
+print("=" * 60)
+print(f"DERIV PULLBACK SCANNER {VERSION}")
+print("NO AUTO TRADING")
+print("=" * 60)
 
 
 # ============================================================
 # ENVIRONMENT
 # ============================================================
 
-DERIV_WS_URL = os.getenv(
-    "DERIV_WS_URL",
-    "wss://ws.binaryws.com/websockets/v3"
+# IMPORTANT:
+# This is the current public Deriv market-data endpoint.
+# No authentication is required for public market data.
+PUBLIC_WS_URL = (
+    "wss://api.derivws.com/trading/v1/options/ws/public"
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# If DERIV_WS_URL exists in Railway, it will be used.
+# We also protect against the old binaryws endpoint.
+DERIV_WS_URL = os.getenv(
+    "DERIV_WS_URL",
+    PUBLIC_WS_URL
+).strip()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+).strip()
+
+GROQ_API_KEY = os.getenv(
+    "GROQ_API_KEY",
+    ""
+).strip()
+
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "openai/gpt-oss-120b"
-)
+).strip()
 
-# IMPORTANT:
-# 60 seconds is recommended because the actual entry is on 5M.
 SCAN_INTERVAL_SECONDS = int(
     os.getenv("SCAN_INTERVAL_SECONDS", "60")
 )
@@ -81,50 +101,12 @@ TARGETS = [
     "CRASH 600",
     "CRASH 900",
     "CRASH 1000",
-
     "BOOM 300",
     "BOOM 500",
     "BOOM 600",
     "BOOM 900",
     "BOOM 1000",
 ]
-
-
-# ============================================================
-# STRATEGY SETTINGS
-# ============================================================
-
-# Spike detection
-SPIKE_MIN_ATR = 1.20
-SPIKE_MAX_LOOKBACK_BARS = 3
-
-# Spike must have meaningful directional movement
-SPIKE_MIN_BODY_ATR = 0.55
-
-# How long a spike remains usable
-MAX_SPIKE_AGE_BARS = 8
-
-# Pullback
-PULLBACK_MIN_ATR = 0.15
-PULLBACK_MAX_ATR = 1.80
-
-# Pullback extreme should not become ancient
-MAX_PULLBACK_AGE_BARS = 4
-
-# Reversal candle protection
-MAX_REVERSAL_ATR = 1.80
-
-# Early entry
-ENTRY_ON_WEAKENING = True
-
-# Minimum score
-SIGNAL_MIN = 8
-
-# 5M trigger must agree with desired direction
-REQUIRE_5M_TRIGGER = True
-
-# HTF confirmation
-LOWER_TF_REQUIRED = 2
 
 
 # ============================================================
@@ -140,56 +122,101 @@ TIMEFRAMES = {
 
 
 # ============================================================
-# HTTP SESSION
+# STRATEGY SETTINGS
 # ============================================================
 
-HTTP = requests.Session()
+EMA_FAST = 20
+EMA_SLOW = 50
+RSI_LENGTH = 14
+ATR_LENGTH = 14
 
-HTTP.headers.update({
-    "User-Agent": "Deriv-Pullback-Scanner/2026"
-})
+# Spike detection
+SPIKE_ATR_MULT = 1.10
+SPIKE_LOOKBACK = 12
+SPIKE_MAX_AGE = 8
+
+# Pullback
+PULLBACK_MIN_ATR = 0.15
+PULLBACK_MAX_ATR = 1.80
+
+# Reversal candle
+MAX_REVERSAL_ATR = 1.80
+
+# Signal quality
+MIN_LOWER_TF_AGREEMENT = 2
+
+# 5M entry
+ENTRY_MIN_BODY_ATR = 0.08
+
+# Do not send another alert for same symbol/direction/candle
+DUPLICATE_PROTECTION = True
+
+
+# ============================================================
+# UTILITY
+# ============================================================
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def normalize_name(value):
+    if value is None:
+        return ""
+
+    return (
+        str(value)
+        .upper()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+        .replace("INDEX", "")
+    )
+
+
+def safe_float(value, default=np.nan):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-def default_state():
-    return {
+def load_state():
+    default = {
         "version": VERSION,
+        "alerts": {},
         "setups": {},
-        "sent": {},
-        "symbol_map": {},
     }
 
-
-def load_state():
     try:
         if not os.path.exists(STATE_FILE):
-            return default_state()
+            return default
 
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
 
-        if not isinstance(state, dict):
-            return default_state()
-
-        # Old scanner states are deliberately discarded.
-        # This prevents old setup structures from interfering
-        # with this new strategy.
+        # Reset old state after strategy/API changes.
         if state.get("version") != VERSION:
-            print("STATE VERSION CHANGED -> RESETTING OLD SETUPS")
-            return default_state()
+            print("OLD STATE VERSION DETECTED - RESETTING STATE")
+            return default
 
+        state.setdefault("alerts", {})
         state.setdefault("setups", {})
-        state.setdefault("sent", {})
-        state.setdefault("symbol_map", {})
+        state["version"] = VERSION
 
         return state
 
     except Exception as e:
         print("STATE LOAD ERROR:", e)
-        return default_state()
+        return default
 
 
 def save_state(state):
@@ -197,12 +224,7 @@ def save_state(state):
         tmp = STATE_FILE + ".tmp"
 
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(
-                state,
-                f,
-                indent=2,
-                default=str
-            )
+            json.dump(state, f, indent=2)
 
         os.replace(tmp, STATE_FILE)
 
@@ -214,38 +236,49 @@ STATE = load_state()
 
 
 # ============================================================
-# BASIC HELPERS
+# TELEGRAM
 # ============================================================
 
-def now_utc():
-    return datetime.now(timezone.utc)
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN missing")
+        return False
 
+    if not TELEGRAM_CHAT_ID:
+        print("TELEGRAM_CHAT_ID missing")
+        return False
 
-def iso_now():
-    return now_utc().isoformat()
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
 
-def safe_float(value, default=0.0):
     try:
-        return float(value)
-    except Exception:
-        return default
+        r = requests.post(
+            url,
+            json=payload,
+            timeout=20
+        )
 
+        if r.ok:
+            return True
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+        print(
+            "TELEGRAM ERROR:",
+            r.status_code,
+            r.text[:500]
+        )
 
+    except Exception as e:
+        print("TELEGRAM REQUEST ERROR:", e)
 
-def direction_label(direction):
-    if direction == "BUY":
-        return "BULLISH"
-    if direction == "SELL":
-        return "BEARISH"
-    return "NEUTRAL"
-
-
-def opposite(direction):
-    return "SELL" if direction == "BUY" else "BUY"
+    return False
 
 
 # ============================================================
@@ -258,164 +291,102 @@ def ws_connect():
             "websocket-client is not installed"
         )
 
+    url = DERIV_WS_URL
+
+    # Protect against the old endpoint causing:
+    # 401 InvalidAppID
+    if "ws.binaryws.com/websockets/v3" in url:
+        print(
+            "OLD DERIV ENDPOINT DETECTED - "
+            "USING CURRENT PUBLIC ENDPOINT"
+        )
+        url = PUBLIC_WS_URL
+
+    print("Connecting to Deriv public market-data WebSocket...")
+
     ws = websocket.create_connection(
-        DERIV_WS_URL,
-        timeout=20
+        url,
+        timeout=25
     )
+
+    print("DERIV WEBSOCKET CONNECTED")
 
     return ws
 
 
-# ============================================================
-# ACTIVE SYMBOL DISCOVERY
-# ============================================================
+def recv_json(ws, timeout=25):
+    ws.settimeout(timeout)
 
-def normalise_name(value):
-    return (
-        str(value)
-        .upper()
-        .replace("_", " ")
-        .replace("-", " ")
-        .replace("/", " ")
-        .replace("INDEX", "")
+    raw = ws.recv()
+
+    if not raw:
+        raise RuntimeError(
+            "Empty WebSocket response"
+        )
+
+    try:
+        return json.loads(raw)
+
+    except Exception:
+        raise RuntimeError(
+            f"Invalid JSON from Deriv: {raw[:500]}"
+        )
+
+
+def request(ws, payload, expected_types=None, timeout=25):
+    ws.send(json.dumps(payload))
+
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+
+        remaining = max(
+            1,
+            int(deadline - time.time())
+        )
+
+        ws.settimeout(remaining)
+
+        try:
+            data = recv_json(ws, remaining)
+
+        except Exception:
+            raise
+
+        if "error" in data:
+            raise RuntimeError(
+                str(data["error"])
+            )
+
+        msg_type = data.get("msg_type")
+
+        if expected_types is None:
+            return data
+
+        if msg_type in expected_types:
+            return data
+
+        # Ignore unrelated messages.
+        continue
+
+    raise TimeoutError(
+        f"Timed out waiting for {expected_types}"
     )
 
 
-def target_matches(display_name, target):
-    a = normalise_name(display_name)
-    b = normalise_name(target)
-
-    # Remove repeated whitespace
-    a = " ".join(a.split())
-    b = " ".join(b.split())
-
-    return b in a or a in b
-
+# ============================================================
+# SYMBOL DISCOVERY
+# ============================================================
 
 def discover_symbols():
     """
-    Find the actual Deriv symbols corresponding to:
-      CRASH 300
-      CRASH 500
-      ...
-      BOOM 1000
-    """
+    Uses current Deriv active_symbols API.
 
-    try:
-        ws = ws_connect()
+    New API fields:
+      underlying_symbol
+      underlying_symbol_name
 
-        request = {
-            "active_symbols": "brief",
-            "product_type": "basic",
-        }
-
-        ws.send(json.dumps(request))
-
-        response = json.loads(ws.recv())
-
-        ws.close()
-
-        if response.get("error"):
-            raise RuntimeError(
-                response["error"].get("message", "active_symbols error")
-            )
-
-        symbols = response.get("active_symbols", [])
-
-        found = {}
-
-        for item in symbols:
-            symbol = item.get("symbol")
-            display = (
-                item.get("display_name")
-                or item.get("name")
-                or ""
-            )
-
-            if not symbol:
-                continue
-
-            for target in TARGETS:
-                if target in found:
-                    continue
-
-                if target_matches(display, target):
-                    found[target] = symbol
-
-        # Sometimes display_name is not exactly what we expect.
-        # Try a second flexible matching pass.
-        for target in TARGETS:
-            if target in found:
-                continue
-
-            target_norm = normalise_name(target)
-
-            for item in symbols:
-                symbol = item.get("symbol")
-                display = normalise_name(
-                    item.get("display_name")
-                    or item.get("name")
-                    or ""
-                )
-
-                digits = "".join(
-                    c for c in target_norm
-                    if c.isdigit()
-                )
-
-                if (
-                    digits
-                    and digits in display
-                    and (
-                        "CRASH" in target_norm
-                        and "CRASH" in display
-                        or
-                        "BOOM" in target_norm
-                        and "BOOM" in display
-                    )
-                ):
-                    found[target] = symbol
-                    break
-
-        if found:
-            print("SYMBOL MAP:")
-            for k, v in found.items():
-                print(f"  {k} -> {v}")
-
-        else:
-            print("WARNING: NO TARGET SYMBOLS FOUND")
-
-        return found
-
-    except Exception as e:
-        print("SYMBOL DISCOVERY ERROR:", e)
-        return {}
-
-
-def get_symbol_map():
-    existing = STATE.get("symbol_map", {})
-
-    if len(existing) >= len(TARGETS):
-        return existing
-
-    fresh = discover_symbols()
-
-    if fresh:
-        STATE["symbol_map"] = fresh
-        save_state(STATE)
-
-    return fresh
-
-
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
-def get_candles(symbol, granularity, count=200):
-    """
-    Fetch completed candles from Deriv.
-
-    Uses one websocket connection for one request.
+    Legacy fields are also supported as fallback.
     """
 
     ws = None
@@ -423,103 +394,238 @@ def get_candles(symbol, granularity, count=200):
     try:
         ws = ws_connect()
 
-        request = {
+        response = request(
+            ws,
+            {
+                "active_symbols": "brief",
+            },
+            expected_types={"active_symbols"},
+            timeout=25
+        )
+
+        items = response.get(
+            "active_symbols",
+            []
+        )
+
+        if not items:
+            raise RuntimeError(
+                "Deriv returned zero active symbols"
+            )
+
+        discovered = {}
+
+        for item in items:
+
+            symbol = (
+                item.get("underlying_symbol")
+                or item.get("symbol")
+            )
+
+            display = (
+                item.get("underlying_symbol_name")
+                or item.get("display_name")
+                or item.get("name")
+                or symbol
+            )
+
+            if not symbol:
+                continue
+
+            discovered[
+                normalize_name(display)
+            ] = symbol
+
+            discovered[
+                normalize_name(symbol)
+            ] = symbol
+
+        result = {}
+
+        for target in TARGETS:
+
+            ntarget = normalize_name(target)
+
+            found = None
+
+            # Exact normalized name match
+            for key, symbol in discovered.items():
+
+                if key == ntarget:
+                    found = symbol
+                    break
+
+            # Partial match
+            if found is None:
+
+                for key, symbol in discovered.items():
+
+                    if ntarget in key or key in ntarget:
+                        found = symbol
+                        break
+
+            if found:
+                result[target] = found
+                print(
+                    f"FOUND {target} -> {found}"
+                )
+
+            else:
+                print(
+                    f"NOT FOUND: {target}"
+                )
+
+        if not result:
+            raise RuntimeError(
+                "None of the requested synthetic indices "
+                "were found."
+            )
+
+        return result
+
+    finally:
+
+        if ws is not None:
+
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+# CANDLE DATA
+# ============================================================
+
+def fetch_candles(
+    symbol,
+    granularity,
+    count=250
+):
+    """
+    Fetch OHLC candles from Deriv ticks_history.
+    """
+
+    ws = None
+
+    try:
+        ws = ws_connect()
+
+        payload = {
             "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": count,
             "end": "latest",
             "style": "candles",
-            "granularity": granularity,
+            "granularity": int(granularity),
+            "count": int(count),
             "subscribe": 0,
         }
 
-        ws.send(json.dumps(request))
+        response = request(
+            ws,
+            payload,
+            expected_types={"candles"},
+            timeout=30
+        )
 
-        while True:
-            raw = ws.recv()
-
-            if not raw:
-                continue
-
-            response = json.loads(raw)
-
-            if response.get("error"):
-                raise RuntimeError(
-                    response["error"].get(
-                        "message",
-                        "Deriv candle error"
-                    )
-                )
-
-            if response.get("msg_type") == "candles":
-                candles = response.get("candles", [])
-                break
+        candles = response.get(
+            "candles",
+            []
+        )
 
         if not candles:
             raise RuntimeError(
-                f"No candles returned for {symbol} {granularity}"
+                f"No candles returned for {symbol}"
             )
 
         rows = []
 
-        for c in candles:
-            try:
-                epoch = int(c["epoch"])
+        for candle in candles:
 
-                rows.append({
-                    "time": pd.to_datetime(
-                        epoch,
-                        unit="s",
-                        utc=True
-                    ),
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                })
+            epoch = candle.get("epoch")
 
-            except Exception:
+            if epoch is None:
                 continue
 
-        if not rows:
-            raise RuntimeError(
-                f"No valid candles for {symbol}"
-            )
+            rows.append({
+                "time": pd.to_datetime(
+                    int(epoch),
+                    unit="s",
+                    utc=True
+                ),
+                "open": safe_float(
+                    candle.get("open")
+                ),
+                "high": safe_float(
+                    candle.get("high")
+                ),
+                "low": safe_float(
+                    candle.get("low")
+                ),
+                "close": safe_float(
+                    candle.get("close")
+                ),
+            })
 
         df = pd.DataFrame(rows)
 
-        df = df.dropna()
-
-        df = df.sort_values("time")
-
-        df = df.drop_duplicates(
-            subset=["time"]
-        )
-
-        # Remove currently forming candle.
-        current_epoch = int(
-            now_utc().timestamp()
-        )
-
-        if len(df) > 0:
-            last_epoch = int(
-                df.iloc[-1]["time"].timestamp()
+        if df.empty:
+            raise RuntimeError(
+                f"Empty candle dataframe: {symbol}"
             )
 
-            if last_epoch + granularity > current_epoch:
-                df = df.iloc[:-1].copy()
+        for col in [
+            "open",
+            "high",
+            "low",
+            "close"
+        ]:
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
 
-        if len(df) < 30:
+        df = df.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close"
+            ]
+        )
+
+        df = (
+            df.sort_values("time")
+            .drop_duplicates("time")
+            .reset_index(drop=True)
+        )
+
+        # Remove current/incomplete candle.
+        now = pd.Timestamp.now(tz="UTC")
+
+        candle_seconds = int(granularity)
+
+        cutoff = (
+            now.floor(
+                f"{candle_seconds}s"
+            )
+        )
+
+        df = df[
+            df["time"] < cutoff
+        ].copy()
+
+        if len(df) < 60:
             raise RuntimeError(
-                f"Too few completed candles: "
-                f"{symbol} {granularity} "
-                f"{len(df)}"
+                f"Not enough completed candles "
+                f"for {symbol}: {len(df)}"
             )
 
         return df.reset_index(drop=True)
 
     finally:
+
         if ws is not None:
+
             try:
                 ws.close()
             except Exception:
@@ -537,29 +643,8 @@ def ema(series, length):
     ).mean()
 
 
-def atr(df, length=14):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    prev_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return tr.ewm(
-        alpha=1 / length,
-        adjust=False
-    ).mean()
-
-
 def rsi(series, length=14):
+
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -587,182 +672,94 @@ def rsi(series, length=14):
     return result.fillna(50)
 
 
-def supertrend_direction(df, atr_length=10, factor=3.0):
-    """
-    Returns:
-        1  bullish
-       -1  bearish
-        0  unavailable
-    """
+def atr(df, length=14):
 
-    if len(df) < atr_length + 5:
-        return 0
+    prev_close = df["close"].shift(1)
 
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
+    tr1 = (
+        df["high"] -
+        df["low"]
+    )
 
-    atr_values = atr(
+    tr2 = (
+        df["high"] -
+        prev_close
+    ).abs()
+
+    tr3 = (
+        df["low"] -
+        prev_close
+    ).abs()
+
+    tr = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    return tr.ewm(
+        alpha=1 / length,
+        adjust=False
+    ).mean()
+
+
+def add_indicators(df):
+
+    df = df.copy()
+
+    df["ema20"] = ema(
+        df["close"],
+        EMA_FAST
+    )
+
+    df["ema50"] = ema(
+        df["close"],
+        EMA_SLOW
+    )
+
+    df["rsi"] = rsi(
+        df["close"],
+        RSI_LENGTH
+    )
+
+    df["atr"] = atr(
         df,
-        atr_length
-    ).values
-
-    upper = (
-        (h + l) / 2
-        + factor * atr_values
+        ATR_LENGTH
     )
 
-    lower = (
-        (h + l) / 2
-        - factor * atr_values
+    # ATR-normalized body
+    df["body"] = (
+        df["close"] -
+        df["open"]
     )
 
-    final_upper = upper.copy()
-    final_lower = lower.copy()
+    df["body_abs"] = df["body"].abs()
 
-    trend = np.ones(len(df))
-
-    for i in range(1, len(df)):
-
-        if (
-            upper[i] < final_upper[i - 1]
-            or c[i - 1] > final_upper[i - 1]
-        ):
-            final_upper[i] = upper[i]
-        else:
-            final_upper[i] = final_upper[i - 1]
-
-        if (
-            lower[i] > final_lower[i - 1]
-            or c[i - 1] < final_lower[i - 1]
-        ):
-            final_lower[i] = lower[i]
-        else:
-            final_lower[i] = final_lower[i - 1]
-
-        if trend[i - 1] == -1:
-            if c[i] > final_upper[i]:
-                trend[i] = 1
-            else:
-                trend[i] = -1
-        else:
-            if c[i] < final_lower[i]:
-                trend[i] = -1
-            else:
-                trend[i] = 1
-
-    return int(trend[-1])
-
-
-# ============================================================
-# SNAPSHOT
-# ============================================================
-
-def indicator_snapshot(df):
-    if len(df) < 55:
-        return None
-
-    close = df["close"]
-
-    ema20 = ema(close, 20)
-    ema50 = ema(close, 50)
-
-    atr14 = atr(df, 14)
-
-    st = supertrend_direction(
-        df,
-        10,
-        3.0
+    df["range"] = (
+        df["high"] -
+        df["low"]
     )
 
-    current = float(close.iloc[-1])
+    df["body_atr"] = (
+        df["body_abs"] /
+        df["atr"].replace(0, np.nan)
+    )
 
-    ema20_now = float(ema20.iloc[-1])
-    ema50_now = float(ema50.iloc[-1])
-
-    # Three broad trend components
-    price_above_ema20 = current > ema20_now
-    ema20_above_ema50 = ema20_now > ema50_now
-
-    if len(ema20) >= 4:
-        ema20_slope_up = (
-            ema20.iloc[-1] > ema20.iloc[-4]
-        )
-    else:
-        ema20_slope_up = False
-
-    bullish_score = sum([
-        price_above_ema20,
-        ema20_above_ema50,
-        ema20_slope_up,
-    ])
-
-    bearish_score = sum([
-        not price_above_ema20,
-        not ema20_above_ema50,
-        not ema20_slope_up,
-    ])
-
-    if bullish_score >= 2:
-        broad_direction = "BULLISH"
-
-    elif bearish_score >= 2:
-        broad_direction = "BEARISH"
-
-    else:
-        broad_direction = "NEUTRAL"
-
-    return {
-        "close": current,
-        "ema20": ema20_now,
-        "ema50": ema50_now,
-        "atr": float(atr14.iloc[-1]),
-        "supertrend": st,
-
-        "price_above_ema20": bool(
-            price_above_ema20
-        ),
-
-        "ema20_above_ema50": bool(
-            ema20_above_ema50
-        ),
-
-        "ema20_slope_up": bool(
-            ema20_slope_up
-        ),
-
-        "bullish_score": int(
-            bullish_score
-        ),
-
-        "bearish_score": int(
-            bearish_score
-        ),
-
-        "direction": broad_direction,
-    }
+    return df
 
 
 # ============================================================
 # 12H DATA
 # ============================================================
 
-def build_12h_from_4h(df4h):
-    """
-    Build completed 12H candles from completed 4H candles.
-    """
+def build_12h(df_4h):
 
-    if len(df4h) < 20:
-        return pd.DataFrame()
-
-    x = df4h.copy()
+    x = df_4h.copy()
 
     x = x.set_index("time")
 
     result = x.resample(
         "12h",
-        label="left",
-        closed="left"
+        origin="start_day"
     ).agg({
         "open": "first",
         "high": "max",
@@ -774,647 +771,449 @@ def build_12h_from_4h(df4h):
 
     result = result.reset_index()
 
-    # Only accept a fully completed 12H block.
-    current_time = now_utc()
-
-    result = result[
-        result["time"] + pd.Timedelta(
-            hours=12
-        ) <= current_time
-    ]
-
-    return result.reset_index(drop=True)
+    return add_indicators(result)
 
 
 # ============================================================
 # TIMEFRAME DIRECTION
 # ============================================================
 
-def tf_direction(snapshot):
-    """
-    Each timeframe gets a balanced 2-of-3 direction:
+def direction_score(df):
 
-    1. price vs EMA20
-    2. EMA20 vs EMA50
-    3. Supertrend
+    if len(df) < 55:
+        return 0, {
+            "price": False,
+            "ema": False,
+            "slope": False,
+        }
 
-    This avoids requiring every indicator to agree.
-    """
+    last = df.iloc[-1]
 
-    if not snapshot:
-        return "NEUTRAL"
+    price = float(last["close"])
+    e20 = float(last["ema20"])
+    e50 = float(last["ema50"])
 
-    bullish = sum([
-        snapshot["price_above_ema20"],
-        snapshot["ema20_above_ema50"],
-        snapshot["supertrend"] == 1,
-    ])
+    previous_ema = float(
+        df["ema20"].iloc[-4]
+    )
 
-    bearish = sum([
-        not snapshot["price_above_ema20"],
-        not snapshot["ema20_above_ema50"],
-        snapshot["supertrend"] == -1,
-    ])
+    slope_up = e20 > previous_ema
+    slope_down = e20 < previous_ema
 
-    if bullish >= 2:
-        return "BULLISH"
+    bullish_points = 0
+    bearish_points = 0
 
-    if bearish >= 2:
-        return "BEARISH"
+    if price > e20:
+        bullish_points += 1
+    elif price < e20:
+        bearish_points += 1
 
-    return "NEUTRAL"
+    if e20 > e50:
+        bullish_points += 1
+    elif e20 < e50:
+        bearish_points += 1
+
+    if slope_up:
+        bullish_points += 1
+    elif slope_down:
+        bearish_points += 1
+
+    if bullish_points >= 2:
+        direction = 1
+
+    elif bearish_points >= 2:
+        direction = -1
+
+    else:
+        direction = 0
+
+    details = {
+        "price": price > e20,
+        "ema": e20 > e50,
+        "slope": slope_up,
+    }
+
+    return direction, details
+
+
+# ============================================================
+# 12H REGIME
+# ============================================================
+
+def get_12h_regime(df):
+
+    direction, details = direction_score(df)
+
+    return direction
+
+
+# ============================================================
+# LOWER TIMEFRAME ALIGNMENT
+# ============================================================
+
+def get_alignment(
+    df_12h,
+    df_4h,
+    df_1h,
+    df_15m,
+    df_5m,
+    expected_direction
+):
+
+    d12, _ = direction_score(df_12h)
+    d4, _ = direction_score(df_4h)
+    d1, _ = direction_score(df_1h)
+    d15, _ = direction_score(df_15m)
+    d5, _ = direction_score(df_5m)
+
+    lower = [
+        d4,
+        d1,
+        d15,
+    ]
+
+    lower_agreement = sum(
+        1
+        for d in lower
+        if d == expected_direction
+    )
+
+    # 12H must agree.
+    h12_ok = (
+        d12 == expected_direction
+    )
+
+    # At least 2 of 4H, 1H, 15M must agree.
+    lower_ok = (
+        lower_agreement >=
+        MIN_LOWER_TF_AGREEMENT
+    )
+
+    # 5M should also point in expected direction.
+    five_ok = (
+        d5 == expected_direction
+    )
+
+    return {
+        "12H": d12,
+        "4H": d4,
+        "1H": d1,
+        "15M": d15,
+        "5M": d5,
+        "h12_ok": h12_ok,
+        "lower_agreement": lower_agreement,
+        "lower_ok": lower_ok,
+        "five_ok": five_ok,
+    }
 
 
 # ============================================================
 # SPIKE DETECTION
 # ============================================================
 
-def candle_stats(row):
-    candle_range = max(
-        safe_float(row["high"]) -
-        safe_float(row["low"]),
-        0.0
-    )
+def detect_spike(
+    df_15m,
+    expected_direction
+):
 
-    body = abs(
-        safe_float(row["close"]) -
-        safe_float(row["open"])
-    )
-
-    return candle_range, body
-
-
-def detect_recent_spike(df5m, desired_direction):
     """
-    Detect a spike over 1-3 candles.
+    CRASH SELL:
+        Find recent large bearish candle.
 
-    CRASH:
-        downward impulse
+    BOOM BUY:
+        Find recent large bullish candle.
 
-    BOOM:
-        upward impulse
+    Uses body and range so a spike is not restricted
+    to exactly one candle shape.
     """
 
-    if len(df5m) < 30:
-        return None
+    df = df_15m.copy()
 
-    atr_series = atr(
-        df5m,
-        14
-    )
-
-    latest = len(df5m) - 1
-
-    # Search recent candles, but don't search indefinitely.
     start = max(
-        15,
-        latest - 6
+        2,
+        len(df) - SPIKE_LOOKBACK
     )
 
     candidates = []
 
-    for end_idx in range(
+    for i in range(
         start,
-        latest + 1
+        len(df) - 1
     ):
 
-        for bars in range(
-            1,
-            SPIKE_MAX_LOOKBACK_BARS + 1
+        row = df.iloc[i]
+
+        atr_value = float(row["atr"])
+
+        if (
+            not np.isfinite(atr_value)
+            or atr_value <= 0
         ):
+            continue
 
-            begin_idx = end_idx - bars + 1
+        body = float(
+            row["close"] -
+            row["open"]
+        )
 
-            if begin_idx < 15:
-                continue
+        body_abs = abs(body)
 
-            section = df5m.iloc[
-                begin_idx:end_idx + 1
-            ]
+        candle_range = float(
+            row["high"] -
+            row["low"]
+        )
 
-            start_price = float(
-                section["open"].iloc[0]
+        body_atr = (
+            body_abs /
+            atr_value
+        )
+
+        range_atr = (
+            candle_range /
+            atr_value
+        )
+
+        bearish = body < 0
+        bullish = body > 0
+
+        # CRASH spike
+        if expected_direction == -1:
+
+            correct_direction = bearish
+
+            close_near_low = (
+                row["close"] <=
+                row["low"] +
+                candle_range * 0.40
             )
 
-            end_price = float(
-                section["close"].iloc[-1]
-            )
-
-            move = end_price - start_price
-
-            atr_ref = float(
-                atr_series.iloc[end_idx]
-            )
-
-            if atr_ref <= 0:
-                continue
-
-            total_body = (
-                section["close"]
-                - section["open"]
-            ).abs().sum()
-
-            move_atr = abs(move) / atr_ref
-            body_atr = (
-                float(total_body)
-                / atr_ref
-            )
-
-            if desired_direction == "SELL":
-                correct_move = move < 0
-
-            else:
-                correct_move = move > 0
-
-            if not correct_move:
-                continue
-
-            if move_atr < SPIKE_MIN_ATR:
-                continue
-
-            if body_atr < SPIKE_MIN_BODY_ATR:
-                continue
-
-            # Calculate strongest candle in this impulse.
-            max_single_atr = 0.0
-
-            for j in range(
-                begin_idx,
-                end_idx + 1
-            ):
-                r, b = candle_stats(
-                    df5m.iloc[j]
-                )
-
-                a = float(
-                    atr_series.iloc[j]
-                )
-
-                if a > 0:
-                    max_single_atr = max(
-                        max_single_atr,
-                        r / a
+            valid = (
+                correct_direction
+                and
+                (
+                    body_atr >= SPIKE_ATR_MULT
+                    or
+                    (
+                        range_atr >= 1.35
+                        and close_near_low
                     )
+                )
+            )
 
-            candidates.append({
-                "start_idx": begin_idx,
-                "end_idx": end_idx,
-                "bars": bars,
-                "move_atr": move_atr,
-                "body_atr": body_atr,
-                "max_single_atr": max_single_atr,
-                "time": df5m.iloc[
-                    end_idx
-                ]["time"].isoformat(),
-            })
+        # BOOM spike
+        else:
+
+            correct_direction = bullish
+
+            close_near_high = (
+                row["close"] >=
+                row["high"] -
+                candle_range * 0.40
+            )
+
+            valid = (
+                correct_direction
+                and
+                (
+                    body_atr >= SPIKE_ATR_MULT
+                    or
+                    (
+                        range_atr >= 1.35
+                        and close_near_high
+                    )
+                )
+            )
+
+        if not valid:
+            continue
+
+        candidates.append({
+            "index": i,
+            "time": row["time"],
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "open": float(row["open"]),
+            "atr": atr_value,
+            "size_atr": max(
+                body_atr,
+                range_atr
+            ),
+        })
 
     if not candidates:
         return None
 
-    # Strongest / most recent useful candidate
-    candidates.sort(
-        key=lambda x: (
-            x["move_atr"],
-            x["end_idx"]
-        ),
-        reverse=True
-    )
-
-    return candidates[0]
+    # Most recent valid spike
+    return candidates[-1]
 
 
 # ============================================================
-# STATEFUL SETUP DETECTION
+# PULLBACK ANALYSIS
 # ============================================================
 
-def setup_key(target):
-    return target
+def analyze_pullback(
+    df_15m,
+    spike,
+    expected_direction
+):
 
-
-def get_setup(target):
-    return STATE["setups"].get(
-        setup_key(target)
-    )
-
-
-def clear_setup(target):
-    STATE["setups"].pop(
-        setup_key(target),
-        None
-    )
-
-
-def store_setup(target, setup):
-    STATE["setups"][
-        setup_key(target)
-    ] = setup
-
-
-def setup_age(df5m, setup):
-    spike_time = setup.get("spike_time")
-
-    if not spike_time:
-        return 999
-
-    matches = np.where(
-        df5m["time"].astype(str).values
-        == spike_time
-    )[0]
-
-    if len(matches) == 0:
-        return 999
-
-    idx = int(matches[-1])
-
-    return (
-        len(df5m) - 1 - idx
-    )
-
-
-def locate_spike_index(df5m, setup):
-    spike_time = setup.get(
-        "spike_time"
-    )
-
-    if not spike_time:
+    if spike is None:
         return None
 
-    times = df5m["time"].astype(str)
+    spike_index = spike["index"]
 
-    matches = np.where(
-        times.values == spike_time
-    )[0]
-
-    if len(matches) == 0:
-        return None
-
-    return int(matches[-1])
-
-
-def create_spike_state(
-    df5m,
-    candidate,
-    direction
-):
-    idx = candidate["end_idx"]
-
-    row = df5m.iloc[idx]
-
-    return {
-        "direction": direction,
-        "spike_time": row["time"].isoformat(),
-        "spike_close": float(row["close"]),
-        "spike_high": float(row["high"]),
-        "spike_low": float(row["low"]),
-        "spike_size_atr": float(
-            candidate["move_atr"]
-        ),
-        "spike_body_atr": float(
-            candidate["body_atr"]
-        ),
-        "spike_bars": int(
-            candidate["bars"]
-        ),
-        "created_at": iso_now(),
-        "phase": "SPIKE_DETECTED",
-    }
-
-
-def analyse_active_setup(
-    df5m,
-    setup,
-    direction
-):
-    """
-    Turn an active spike into:
-
-      WAITING_FOR_PULLBACK
-      PULLBACK_WEAKENING
-      CONTROLLED_REVERSAL
-      READY
-    """
-
-    spike_idx = locate_spike_index(
-        df5m,
-        setup
-    )
-
-    if spike_idx is None:
-        return {
-            "valid": False,
-            "phase": "SPIKE_NOT_FOUND"
-        }
+    current_index = len(df_15m) - 1
 
     age = (
-        len(df5m) - 1 - spike_idx
+        current_index -
+        spike_index
     )
 
-    if age > MAX_SPIKE_AGE_BARS:
+    if age <= 0:
         return {
-            "valid": False,
-            "phase": "SPIKE_TOO_OLD",
+            "phase": "SPIKE",
             "age": age,
+            "pullback_atr": 0,
+            "reversal_atr": 0,
         }
 
-    if age < 1:
+    if age > SPIKE_MAX_AGE:
         return {
-            "valid": True,
-            "phase": "SPIKE_DETECTED",
+            "phase": "EXPIRED",
             "age": age,
+            "pullback_atr": 0,
+            "reversal_atr": 0,
         }
 
-    after = df5m.iloc[
-        spike_idx + 1:
-    ].copy()
+    after = df_15m.iloc[
+        spike_index + 1:
+    ]
 
-    if len(after) < 1:
-        return {
-            "valid": True,
-            "phase": "WAITING_FOR_PULLBACK",
-            "age": age,
-        }
+    if after.empty:
+        return None
 
-    spike_close = float(
-        setup["spike_close"]
-    )
+    current = df_15m.iloc[-1]
 
-    # --------------------------------------------------------
-    # ATR reference
-    # --------------------------------------------------------
-
-    atr_series = atr(
-        df5m,
-        14
-    )
-
-    current_atr = float(
-        atr_series.iloc[-1]
-    )
-
-    if current_atr <= 0:
-        return {
-            "valid": True,
-            "phase": "WAITING_FOR_PULLBACK",
-            "age": age,
-        }
-
-    # --------------------------------------------------------
-    # PULLBACK
-    # --------------------------------------------------------
-
-    if direction == "SELL":
-
-        pullback_extreme = float(
-            after["high"].max()
-        )
-
-        pullback_distance = (
-            pullback_extreme -
-            spike_close
-        )
-
-        pullback_atr = (
-            pullback_distance /
-            current_atr
-        )
-
-        extreme_positions = np.where(
-            after["high"].values
-            == pullback_extreme
-        )[0]
-
-    else:
-
-        pullback_extreme = float(
-            after["low"].min()
-        )
-
-        pullback_distance = (
-            spike_close -
-            pullback_extreme
-        )
-
-        pullback_atr = (
-            pullback_distance /
-            current_atr
-        )
-
-        extreme_positions = np.where(
-            after["low"].values
-            == pullback_extreme
-        )[0]
-
-    if len(extreme_positions) == 0:
-        return {
-            "valid": True,
-            "phase": "WAITING_FOR_PULLBACK",
-            "age": age,
-        }
-
-    pullback_relative_idx = int(
-        extreme_positions[-1]
-    )
-
-    pullback_age = (
-        len(after) - 1
-        - pullback_relative_idx
-    )
-
-    pullback_exists = (
-        pullback_atr >= PULLBACK_MIN_ATR
-        and
-        pullback_atr <= PULLBACK_MAX_ATR
-    )
-
-    if not pullback_exists:
-
-        if (
-            pullback_atr
-            > PULLBACK_MAX_ATR
-        ):
-            return {
-                "valid": False,
-                "phase": "PULLBACK_TOO_DEEP",
-                "age": age,
-                "pullback_atr": pullback_atr,
-            }
-
-        return {
-            "valid": True,
-            "phase": "WAITING_FOR_PULLBACK",
-            "age": age,
-            "pullback_atr": pullback_atr,
-        }
-
-    # --------------------------------------------------------
-    # PULLBACK TOO OLD
-    # --------------------------------------------------------
-
-    if pullback_age > MAX_PULLBACK_AGE_BARS:
-        return {
-            "valid": True,
-            "phase": "PULLBACK_STALE",
-            "age": age,
-            "pullback_atr": pullback_atr,
-        }
-
-    # --------------------------------------------------------
-    # CURRENT CANDLE
-    # --------------------------------------------------------
-
-    current = df5m.iloc[-1]
-    previous = df5m.iloc[-2]
-
-    current_range, current_body = candle_stats(
-        current
-    )
-
-    previous_range, previous_body = candle_stats(
-        previous
-    )
-
-    current_atr = max(
-        current_atr,
-        1e-9
-    )
-
-    current_size_atr = (
-        current_range /
-        current_atr
-    )
-
-    current_body_atr = (
-        current_body /
-        current_atr
-    )
-
-    # Huge candle = not a controlled entry.
-    if current_size_atr > MAX_REVERSAL_ATR:
-        return {
-            "valid": True,
-            "phase": "PULLBACK_BUT_CANDLE_TOO_LARGE",
-            "age": age,
-            "pullback_atr": pullback_atr,
-            "trigger_size_atr": current_size_atr,
-        }
-
-    # --------------------------------------------------------
-    # REVERSAL DIRECTION
-    # --------------------------------------------------------
-
-    if direction == "SELL":
-
-        reversal_direction = (
-            float(current["close"])
-            < float(current["open"])
-        )
-
-        close_moving_direction = (
-            float(current["close"])
-            < float(previous["close"])
-        )
-
-    else:
-
-        reversal_direction = (
-            float(current["close"])
-            > float(current["open"])
-        )
-
-        close_moving_direction = (
-            float(current["close"])
-            > float(previous["close"])
-        )
-
-    # --------------------------------------------------------
-    # PULLBACK WEAKENING
-    # --------------------------------------------------------
-
-    recent_start = max(
-        spike_idx + 1,
-        len(df5m) - 4
-    )
-
-    recent = df5m.iloc[
-        recent_start:
-    ].copy()
-
-    if len(recent) >= 2:
-
-        bodies = []
-
-        for _, row in recent.iterrows():
-            _, b = candle_stats(row)
-            bodies.append(b)
-
-        # Countertrend body weakening.
-        weakening = (
-            len(bodies) >= 2
-            and
-            bodies[-1] <=
-            bodies[-2]
-        )
-
-    else:
-        weakening = False
-
-    # Another useful condition:
-    # the pullback extreme happened recently and price
-    # has now started moving back in the spike direction.
-    early_turn = (
-        pullback_age <= 2
-        and
-        reversal_direction
-        and
-        close_moving_direction
-    )
-
-    controlled_reversal = (
-        reversal_direction
-        and
-        close_moving_direction
-        and
-        current_size_atr
-        <= MAX_REVERSAL_ATR
-        and
-        current_body_atr >= 0.08
+    atr_value = float(
+        current["atr"]
     )
 
     if (
-        ENTRY_ON_WEAKENING
-        and
-        (weakening or early_turn)
-        and
-        controlled_reversal
+        not np.isfinite(atr_value)
+        or atr_value <= 0
     ):
+        return None
+
+    if expected_direction == -1:
+
+        # CRASH:
+        # spike goes DOWN.
+        # pullback must go UP.
+        pullback_high = float(
+            after["high"].max()
+        )
+
+        spike_low = float(
+            spike["low"]
+        )
+
+        pullback_distance = (
+            pullback_high -
+            spike_low
+        )
+
+        pullback_atr = (
+            pullback_distance /
+            atr_value
+        )
+
+        current_close = float(
+            current["close"]
+        )
+
+        # How far current price has returned
+        # toward the spike low.
+        reversal_distance = (
+            pullback_high -
+            current_close
+        )
+
+    else:
+
+        # BOOM:
+        # spike goes UP.
+        # pullback must go DOWN.
+        pullback_low = float(
+            after["low"].min()
+        )
+
+        spike_high = float(
+            spike["high"]
+        )
+
+        pullback_distance = (
+            spike_high -
+            pullback_low
+        )
+
+        pullback_atr = (
+            pullback_distance /
+            atr_value
+        )
+
+        current_close = float(
+            current["close"]
+        )
+
+        reversal_distance = (
+            current_close -
+            pullback_low
+        )
+
+    # No meaningful pullback yet.
+    if pullback_atr < PULLBACK_MIN_ATR:
+
         return {
-            "valid": True,
-            "phase": "PULLBACK_WEAKENING",
+            "phase": "WAITING_FOR_PULLBACK",
             "age": age,
             "pullback_atr": pullback_atr,
-            "pullback_age": pullback_age,
-            "trigger_size_atr": current_size_atr,
-            "trigger_body_atr": current_body_atr,
+            "reversal_atr": 0,
         }
 
-    if controlled_reversal:
+    # Pullback became too large.
+    if pullback_atr > PULLBACK_MAX_ATR:
+
         return {
-            "valid": True,
-            "phase": "CONTROLLED_REVERSAL",
+            "phase": "PULLBACK_TOO_DEEP",
             "age": age,
             "pullback_atr": pullback_atr,
-            "pullback_age": pullback_age,
-            "trigger_size_atr": current_size_atr,
-            "trigger_body_atr": current_body_atr,
+            "reversal_atr": 0,
         }
 
+    reversal_atr = (
+        abs(reversal_distance) /
+        atr_value
+    )
+
+    # If price has already travelled too far
+    # in the original direction, it may be
+    # another spike rather than an entry.
+    if reversal_atr > MAX_REVERSAL_ATR:
+
+        return {
+            "phase": "CONTINUATION_TOO_STRONG",
+            "age": age,
+            "pullback_atr": pullback_atr,
+            "reversal_atr": reversal_atr,
+        }
+
+    # Pullback is mature enough.
     return {
-        "valid": True,
-        "phase": "WAITING_FOR_CONTROLLED_REVERSAL",
+        "phase": "PULLBACK",
         "age": age,
         "pullback_atr": pullback_atr,
-        "pullback_age": pullback_age,
-        "trigger_size_atr": current_size_atr,
+        "reversal_atr": reversal_atr,
     }
 
 
@@ -1422,551 +1221,300 @@ def analyse_active_setup(
 # 5M ENTRY TRIGGER
 # ============================================================
 
-def five_minute_trigger(df5m, direction):
-    if len(df5m) < 25:
-        return False, 50.0
-
-    close = df5m["close"]
-
-    ema20 = ema(
-        close,
-        20
-    )
-
-    r = rsi(
-        close,
-        14
-    )
-
-    current = df5m.iloc[-1]
-    previous = df5m.iloc[-2]
-
-    current_close = float(
-        current["close"]
-    )
-
-    previous_close = float(
-        previous["close"]
-    )
-
-    current_high = float(
-        current["high"]
-    )
-
-    current_low = float(
-        current["low"]
-    )
-
-    previous_high = float(
-        previous["high"]
-    )
-
-    previous_low = float(
-        previous["low"]
-    )
-
-    current_ema = float(
-        ema20.iloc[-1]
-    )
-
-    current_rsi = float(
-        r.iloc[-1]
-    )
-
-    if direction == "SELL":
-
-        # For Crash we want the pullback to start turning down.
-        conditions = [
-            current_close < current_ema,
-            current_close < previous_close,
-            current_close < previous_high,
-            current_low <= previous_low,
-        ]
-
-        score = sum(conditions)
-
-        # Don't demand all 4.
-        trigger = score >= 2
-
-    else:
-
-        conditions = [
-            current_close > current_ema,
-            current_close > previous_close,
-            current_close > previous_low,
-            current_high >= previous_high,
-        ]
-
-        score = sum(conditions)
-
-        trigger = score >= 2
-
-    return trigger, current_rsi
-
-
-# ============================================================
-# HIGHER TIMEFRAME ALIGNMENT
-# ============================================================
-
-def higher_timeframe_alignment(
-    snapshots,
-    direction
+def five_minute_trigger(
+    df_5m,
+    expected_direction
 ):
-    wanted = direction_label(
-        direction
-    )
 
-    h12 = snapshots.get("12H")
+    if len(df_5m) < 60:
+        return False, "not enough 5M data"
 
-    if not h12:
-        return {
-            "h12_ok": False,
-            "h12_direction": "NEUTRAL",
-            "lower_agreement": 0,
-            "lower_total": 3,
-            "all_higher": False,
-            "directions": {},
-        }
+    last = df_5m.iloc[-1]
+    previous = df_5m.iloc[-2]
 
-    h12_direction = h12["direction"]
-
-    h12_ok = (
-        h12_direction == wanted
-    )
-
-    lower_names = [
-        "4H",
-        "1H",
-        "15M",
-    ]
-
-    directions = {}
-
-    agreement = 0
-
-    for name in lower_names:
-
-        snap = snapshots.get(name)
-
-        if not snap:
-            directions[name] = "NEUTRAL"
-            continue
-
-        d = tf_direction(snap)
-
-        directions[name] = d
-
-        if d == wanted:
-            agreement += 1
-
-    lower_ok = (
-        agreement >= LOWER_TF_REQUIRED
-    )
-
-    return {
-        "h12_ok": h12_ok,
-        "h12_direction": h12_direction,
-        "h12_bull_score": h12.get(
-            "bullish_score",
-            0
-        ),
-        "h12_bear_score": h12.get(
-            "bearish_score",
-            0
-        ),
-        "lower_agreement": agreement,
-        "lower_total": len(lower_names),
-        "lower_ok": lower_ok,
-        "all_higher": (
-            h12_ok and lower_ok
-        ),
-        "directions": directions,
-    }
-
-
-# ============================================================
-# TECHNICAL SCORE
-# ============================================================
-
-def calculate_score(
-    structure,
-    alignment,
-    five_trigger,
-):
-    score = 0
-
-    # Spike
-    if structure.get(
-        "spike_size_atr",
-        0
-    ) >= SPIKE_MIN_ATR:
-        score += 2
-
-    # Pullback
-    pullback = structure.get(
-        "pullback_atr",
-        0
+    atr_value = float(
+        last["atr"]
     )
 
     if (
-        PULLBACK_MIN_ATR
-        <= pullback
-        <= PULLBACK_MAX_ATR
+        not np.isfinite(atr_value)
+        or atr_value <= 0
     ):
-        score += 2
+        return False, "invalid ATR"
 
-    # Reversal
-    phase = structure.get(
-        "phase",
-        ""
+    body = float(
+        last["close"] -
+        last["open"]
     )
 
-    if phase == "PULLBACK_WEAKENING":
-        score += 2
+    body_abs = abs(body)
 
-    elif phase == "CONTROLLED_REVERSAL":
-        score += 2
+    body_atr = (
+        body_abs /
+        atr_value
+    )
 
-    # H12
-    if alignment.get(
-        "h12_ok",
-        False
+    # We do NOT want a huge continuation candle.
+    if body_atr > MAX_REVERSAL_ATR:
+        return False, "reversal candle too large"
+
+    # -------------------------
+    # CRASH SELL
+    # -------------------------
+
+    if expected_direction == -1:
+
+        bearish = (
+            last["close"] <
+            last["open"]
+        )
+
+        break_previous_low = (
+            last["close"] <
+            previous["low"]
+        )
+
+        below_ema = (
+            last["close"] <
+            last["ema20"]
+        )
+
+        rsi_ok = (
+            float(last["rsi"]) < 55
+        )
+
+        controlled_body = (
+            body_atr >=
+            ENTRY_MIN_BODY_ATR
+        )
+
+        if (
+            bearish
+            and
+            break_previous_low
+            and
+            below_ema
+            and
+            rsi_ok
+            and
+            controlled_body
+        ):
+            return True, (
+                "5M bearish reversal "
+                "broke previous low"
+            )
+
+        # Secondary trigger:
+        # bearish candle below EMA20
+        # after pullback.
+        if (
+            bearish
+            and
+            below_ema
+            and
+            rsi_ok
+            and
+            controlled_body
+        ):
+            return True, (
+                "5M controlled bearish "
+                "reversal below EMA20"
+            )
+
+        return False, "no bearish 5M trigger"
+
+    # -------------------------
+    # BOOM BUY
+    # -------------------------
+
+    bullish = (
+        last["close"] >
+        last["open"]
+    )
+
+    break_previous_high = (
+        last["close"] >
+        previous["high"]
+    )
+
+    above_ema = (
+        last["close"] >
+        last["ema20"]
+    )
+
+    rsi_ok = (
+        float(last["rsi"]) > 45
+    )
+
+    controlled_body = (
+        body_atr >=
+        ENTRY_MIN_BODY_ATR
+    )
+
+    if (
+        bullish
+        and
+        break_previous_high
+        and
+        above_ema
+        and
+        rsi_ok
+        and
+        controlled_body
     ):
-        score += 2
+        return True, (
+            "5M bullish reversal "
+            "broke previous high"
+        )
 
-    # Lower timeframe
-    if alignment.get(
-        "lower_ok",
-        False
+    # Secondary trigger
+    if (
+        bullish
+        and
+        above_ema
+        and
+        rsi_ok
+        and
+        controlled_body
     ):
-        score += 1
+        return True, (
+            "5M controlled bullish "
+            "reversal above EMA20"
+        )
+
+    return False, "no bullish 5M trigger"
+
+
+# ============================================================
+# QUALITY SCORE
+# ============================================================
+
+def calculate_score(
+    expected_direction,
+    alignment,
+    pullback,
+    trigger
+):
+
+    score = 0
+
+    # 12H
+    if alignment["h12_ok"]:
+        score += 3
+
+    # Lower TF agreement
+    score += alignment[
+        "lower_agreement"
+    ]
 
     # 5M
-    if five_trigger:
+    if alignment["five_ok"]:
+        score += 2
+
+    # Pullback
+    if pullback["phase"] == "PULLBACK":
+        score += 2
+
+    # Better pullback zone
+    pb = pullback["pullback_atr"]
+
+    if (
+        PULLBACK_MIN_ATR <=
+        pb <= 1.20
+    ):
         score += 1
 
-    return min(
-        score,
-        10
-    )
+    # Trigger
+    if trigger:
+        score += 2
+
+    return score
 
 
 # ============================================================
-# GROQ ADVISORY
-# ============================================================
-
-def groq_review(
-    target,
-    direction,
-    score,
-    structure,
-    alignment,
-    five_trigger,
-):
-    """
-    Groq is ADVISORY ONLY.
-
-    It cannot reverse:
-      CRASH SELL
-      BOOM BUY
-
-    It can provide an opinion/note.
-    """
-
-    if not GROQ_API_KEY:
-        return {
-            "decision": "NO_AI",
-            "confidence": 0,
-            "note": "Groq not configured",
-        }
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are reviewing a Deriv Crash/Boom "
-                    "pullback scanner. You are advisory only. "
-                    "Do not invent market data. "
-                    "CRASH setups can only be SELL. "
-                    "BOOM setups can only be BUY. "
-                    "Evaluate whether the technical setup is "
-                    "coherent. Return JSON only with keys: "
-                    "decision, confidence, note. "
-                    "decision must be BUY, SELL, WATCH, or PASS."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps({
-                    "symbol": target,
-                    "technical_direction": direction,
-                    "technical_score": score,
-                    "phase": structure.get(
-                        "phase"
-                    ),
-                    "spike_size_atr": structure.get(
-                        "spike_size_atr"
-                    ),
-                    "pullback_atr": structure.get(
-                        "pullback_atr"
-                    ),
-                    "trigger_size_atr": structure.get(
-                        "trigger_size_atr"
-                    ),
-                    "h12": alignment.get(
-                        "h12_direction"
-                    ),
-                    "lower_timeframes": alignment.get(
-                        "directions"
-                    ),
-                    "lower_agreement": alignment.get(
-                        "lower_agreement"
-                    ),
-                    "five_minute_trigger": five_trigger,
-                }),
-            },
-        ],
-        "temperature": 0.1,
-        "max_completion_tokens": 300,
-    }
-
-    try:
-        response = HTTP.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization":
-                    f"Bearer {GROQ_API_KEY}",
-                "Content-Type":
-                    "application/json",
-            },
-            json=payload,
-            timeout=15,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        content = (
-            data["choices"][0]
-            ["message"]["content"]
-            .strip()
-        )
-
-        # Strip markdown code fences if model uses them.
-        content = content.replace(
-            "```json",
-            ""
-        ).replace(
-            "```",
-            ""
-        ).strip()
-
-        result = json.loads(content)
-
-        return {
-            "decision": str(
-                result.get(
-                    "decision",
-                    "WATCH"
-                )
-            ).upper(),
-
-            "confidence": int(
-                safe_float(
-                    result.get(
-                        "confidence",
-                        0
-                    )
-                )
-            ),
-
-            "note": str(
-                result.get(
-                    "note",
-                    ""
-                )
-            )[:500],
-        }
-
-    except Exception as e:
-        print(
-            f"{target} GROQ ERROR:",
-            e
-        )
-
-        return {
-            "decision": "AI_ERROR",
-            "confidence": 0,
-            "note": "AI review unavailable",
-        }
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN:
-        print("TELEGRAM ERROR: missing TELEGRAM_BOT_TOKEN")
-        return False
-
-    if not TELEGRAM_CHAT_ID:
-        print("TELEGRAM ERROR: missing TELEGRAM_CHAT_ID")
-        return False
-
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    try:
-        response = HTTP.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-            },
-            timeout=15,
-        )
-
-        response.raise_for_status()
-
-        return True
-
-    except Exception as e:
-        print(
-            "TELEGRAM SEND ERROR:",
-            e
-        )
-
-        return False
-
-
-# ============================================================
-# FORMAT MESSAGE
+# SIGNAL MESSAGE
 # ============================================================
 
 def build_signal_message(
     target,
-    direction,
+    symbol,
+    expected_direction,
     score,
-    structure,
+    price,
+    spike,
+    pullback,
     alignment,
-    five_rsi,
-    groq,
+    trigger_reason,
+    rsi_5m
 ):
-    if target.startswith("CRASH"):
+
+    if expected_direction == -1:
         emoji = "🔴"
         action = "SELL"
+        setup_name = "CRASH PULLBACK"
     else:
         emoji = "🟢"
         action = "BUY"
+        setup_name = "BOOM PULLBACK"
 
-    phase = structure.get(
-        "phase",
-        "UNKNOWN"
+    def direction_text(value):
+
+        if value == 1:
+            return "BULLISH"
+
+        if value == -1:
+            return "BEARISH"
+
+        return "NEUTRAL"
+
+    message = (
+        f"{emoji} {target} — {action} PULLBACK SIGNAL\n\n"
+
+        f"Technical score: {score}/15\n"
+        f"Symbol: {symbol}\n"
+        f"Price: {price:.5f}\n\n"
+
+        f"SETUP:\n"
+        f"Spike → Pullback → Reversal\n"
+        f"Type: {setup_name}\n\n"
+
+        f"Spike age: "
+        f"{pullback['age']} candles\n"
+
+        f"Spike size: "
+        f"{spike['size_atr']:.2f} ATR\n"
+
+        f"Pullback: "
+        f"{pullback['pullback_atr']:.2f} ATR\n\n"
+
+        f"MULTI-TIMEFRAME:\n"
+        f"12H: "
+        f"{direction_text(alignment['12H'])}\n"
+
+        f"4H: "
+        f"{direction_text(alignment['4H'])}\n"
+
+        f"1H: "
+        f"{direction_text(alignment['1H'])}\n"
+
+        f"15M: "
+        f"{direction_text(alignment['15M'])}\n"
+
+        f"5M: "
+        f"{direction_text(alignment['5M'])}\n"
+
+        f"5M RSI: "
+        f"{rsi_5m:.1f}\n\n"
+
+        f"ENTRY:\n"
+        f"{trigger_reason}\n\n"
+
+        f"Scanner: {VERSION}\n"
+        f"Time: "
+        f"{utc_now().strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
-    spike_age = structure.get(
-        "age",
-        0
-    )
-
-    spike_size = structure.get(
-        "spike_size_atr",
-        0
-    )
-
-    pullback = structure.get(
-        "pullback_atr",
-        0
-    )
-
-    trigger_size = structure.get(
-        "trigger_size_atr",
-        0
-    )
-
-    lower = alignment.get(
-        "directions",
-        {}
-    )
-
-    h12 = alignment.get(
-        "h12_direction",
-        "NEUTRAL"
-    )
-
-    lower_agreement = alignment.get(
-        "lower_agreement",
-        0
-    )
-
-    lower_total = alignment.get(
-        "lower_total",
-        3
-    )
-
-    ai_decision = groq.get(
-        "decision",
-        "NO_AI"
-    )
-
-    ai_confidence = groq.get(
-        "confidence",
-        0
-    )
-
-    ai_note = groq.get(
-        "note",
-        ""
-    )
-
-    lines = [
-        f"{emoji} {target} — {action} PULLBACK SIGNAL",
-        "",
-        f"Technical score: {score}/10",
-        f"Symbol: {target}",
-        "",
-        "SETUP:",
-        "Spike → Pullback → Weakening/Reversal",
-        "",
-        f"Phase: {phase}",
-        f"Spike age: {spike_age} candles",
-        f"Spike size: {spike_size:.2f} ATR",
-        f"Pullback: {pullback:.2f} ATR",
-        f"Trigger candle: {trigger_size:.2f} ATR",
-        "",
-        "MULTI-TIMEFRAME:",
-        f"12H: {h12}",
-        f"4H: {lower.get('4H', 'NEUTRAL')}",
-        f"1H: {lower.get('1H', 'NEUTRAL')}",
-        f"15M: {lower.get('15M', 'NEUTRAL')}",
-        f"5M: {direction_label(direction)}",
-        f"5M RSI: {five_rsi:.1f}",
-        "",
-        f"HTF agreement: "
-        f"{lower_agreement}/{lower_total}",
-        "",
-        f"Groq advisory: "
-        f"{ai_decision} "
-        f"({ai_confidence}%)",
-    ]
-
-    if ai_note:
-        lines.extend([
-            f"AI note: {ai_note}",
-        ])
-
-    lines.extend([
-        "",
-        "Scanner only — no automatic trade."
-    ])
-
-    return "\n".join(lines)
+    return message
 
 
 # ============================================================
@@ -1975,706 +1523,607 @@ def build_signal_message(
 
 def build_watch_message(
     target,
-    direction,
-    structure,
+    symbol,
+    expected_direction,
+    pullback,
     alignment,
-    five_trigger,
+    spike
 ):
-    if target.startswith("CRASH"):
-        emoji = "👀"
+
+    if expected_direction == -1:
+        emoji = "🔎"
         action = "SELL"
     else:
-        emoji = "👀"
+        emoji = "🔎"
         action = "BUY"
 
-    lower = alignment.get(
-        "directions",
-        {}
+    def d(value):
+
+        if value == 1:
+            return "BULL"
+
+        if value == -1:
+            return "BEAR"
+
+        return "NEUTRAL"
+
+    return (
+        f"{emoji} {target} — WATCH {action}\n\n"
+
+        f"Symbol: {symbol}\n"
+        f"Phase: {pullback['phase']}\n"
+        f"Spike age: {pullback['age']}\n"
+        f"Spike size: "
+        f"{spike['size_atr']:.2f} ATR\n"
+        f"Pullback: "
+        f"{pullback['pullback_atr']:.2f} ATR\n\n"
+
+        f"12H: {d(alignment['12H'])}\n"
+        f"4H: {d(alignment['4H'])}\n"
+        f"1H: {d(alignment['1H'])}\n"
+        f"15M: {d(alignment['15M'])}\n"
+        f"5M: {d(alignment['5M'])}\n\n"
+
+        f"Waiting for the 5M entry trigger."
     )
 
-    return "\n".join([
-        f"{emoji} {target} — WATCH {action}",
-        "",
-        f"Phase: {structure.get('phase')}",
-        f"Spike age: {structure.get('age', 0)} candles",
-        (
-            f"Spike: "
-            f"{structure.get('spike_size_atr', 0):.2f} ATR"
+
+# ============================================================
+# DUPLICATE PROTECTION
+# ============================================================
+
+def already_alerted(
+    target,
+    direction,
+    candle_time
+):
+
+    key = (
+        f"{target}|"
+        f"{direction}"
+    )
+
+    old = STATE["alerts"].get(key)
+
+    return old == str(candle_time)
+
+
+def mark_alerted(
+    target,
+    direction,
+    candle_time
+):
+
+    key = (
+        f"{target}|"
+        f"{direction}"
+    )
+
+    STATE["alerts"][key] = str(
+        candle_time
+    )
+
+    save_state(STATE)
+
+
+# ============================================================
+# SETUP STATE
+# ============================================================
+
+def setup_key(
+    target,
+    direction
+):
+    return (
+        f"{target}|"
+        f"{direction}"
+    )
+
+
+def save_setup(
+    target,
+    direction,
+    spike
+):
+
+    key = setup_key(
+        target,
+        direction
+    )
+
+    STATE["setups"][key] = {
+        "spike_time": str(
+            spike["time"]
         ),
-        (
-            f"Pullback: "
-            f"{structure.get('pullback_atr', 0):.2f} ATR"
+        "spike_size_atr": float(
+            spike["size_atr"]
         ),
-        "",
-        f"12H: "
-        f"{alignment.get('h12_direction', 'NEUTRAL')}",
-        f"4H: {lower.get('4H', 'NEUTRAL')}",
-        f"1H: {lower.get('1H', 'NEUTRAL')}",
-        f"15M: {lower.get('15M', 'NEUTRAL')}",
-        "",
-        f"5M trigger: "
-        f"{'YES' if five_trigger else 'NO'}",
-    ])
+    }
+
+    save_state(STATE)
 
 
-# ============================================================
-# DUPLICATE CONTROL
-# ============================================================
+def get_saved_setup(
+    target,
+    direction
+):
 
-def was_sent(target, candle_time):
-    return STATE["sent"].get(
-        target
-    ) == candle_time
-
-
-def mark_sent(target, candle_time):
-    STATE["sent"][target] = candle_time
-
-    # Keep state from growing forever.
-    if len(STATE["sent"]) > 100:
-        items = list(
-            STATE["sent"].items()
+    return STATE["setups"].get(
+        setup_key(
+            target,
+            direction
         )
+    )
 
-        STATE["sent"] = dict(
-            items[-50:]
-        )
+
+def clear_setup(
+    target,
+    direction
+):
+
+    key = setup_key(
+        target,
+        direction
+    )
+
+    if key in STATE["setups"]:
+
+        del STATE["setups"][key]
+
+        save_state(STATE)
 
 
 # ============================================================
-# ONE TARGET SCAN
+# SCAN ONE SYMBOL
 # ============================================================
 
 def scan_one(
     target,
     symbol
 ):
-    print("")
+
+    print("-" * 60)
     print(
-        f"========== {target} =========="
+        f"SCANNING {target} -> {symbol}"
     )
-    print(
-        f"{target} symbol={symbol}"
-    )
-
-    is_crash = target.startswith(
-        "CRASH"
-    )
-
-    direction = (
-        "SELL"
-        if is_crash
-        else
-        "BUY"
-    )
-
-    # --------------------------------------------------------
-    # FETCH TIMEFRAMES
-    # --------------------------------------------------------
-
-    data = {}
 
     try:
-        for name, granularity in TIMEFRAMES.items():
 
-            count = 220
+        # ----------------------------------------------------
+        # Fetch data
+        # ----------------------------------------------------
 
-            if name == "5M":
-                count = 300
+        df_4h = fetch_candles(
+            symbol,
+            TIMEFRAMES["4H"],
+            220
+        )
 
-            df = get_candles(
-                symbol,
-                granularity,
-                count
+        df_1h = fetch_candles(
+            symbol,
+            TIMEFRAMES["1H"],
+            220
+        )
+
+        df_15m = fetch_candles(
+            symbol,
+            TIMEFRAMES["15M"],
+            250
+        )
+
+        df_5m = fetch_candles(
+            symbol,
+            TIMEFRAMES["5M"],
+            250
+        )
+
+        # ----------------------------------------------------
+        # Indicators
+        # ----------------------------------------------------
+
+        df_4h = add_indicators(
+            df_4h
+        )
+
+        df_1h = add_indicators(
+            df_1h
+        )
+
+        df_15m = add_indicators(
+            df_15m
+        )
+
+        df_5m = add_indicators(
+            df_5m
+        )
+
+        df_12h = build_12h(
+            df_4h
+        )
+
+        if len(df_12h) < 55:
+
+            print(
+                f"{target} - not enough 12H data"
             )
 
-            data[name] = df
+            return
 
-        # 12H from 4H
-        data["12H"] = build_12h_from_4h(
-            data["4H"]
-        )
+        # ----------------------------------------------------
+        # CRASH = SELL ONLY
+        # BOOM = BUY ONLY
+        # ----------------------------------------------------
 
-    except Exception as e:
+        target_upper = target.upper()
 
-        print(
-            f"{target} DATA ERROR:",
-            e
-        )
+        if "CRASH" in target_upper:
 
-        return
+            expected_direction = -1
 
-    # --------------------------------------------------------
-    # SNAPSHOTS
-    # --------------------------------------------------------
+        elif "BOOM" in target_upper:
 
-    snapshots = {}
+            expected_direction = 1
 
-    for tf in [
-        "12H",
-        "4H",
-        "1H",
-        "15M",
-    ]:
+        else:
 
-        snap = indicator_snapshot(
-            data[tf]
-        )
-
-        snapshots[tf] = snap
-
-    if not snapshots["12H"]:
-        print(
-            f"{target} 12H unavailable"
-        )
-        return
-
-    # --------------------------------------------------------
-    # 12H DEBUG
-    # --------------------------------------------------------
-
-    h12 = snapshots["12H"]
-
-    print(
-        f"{target} 12H "
-        f"regime={h12['direction']} "
-        f"bull_score={h12['bullish_score']}/3 "
-        f"bear_score={h12['bearish_score']}/3"
-    )
-
-    # --------------------------------------------------------
-    # HTF ALIGNMENT
-    # --------------------------------------------------------
-
-    alignment = higher_timeframe_alignment(
-        snapshots,
-        direction
-    )
-
-    lower = alignment[
-        "directions"
-    ]
-
-    print(
-        f"{target} ALIGNMENT "
-        f"12H={alignment['h12_ok']} "
-        f"4H={lower.get('4H')} "
-        f"1H={lower.get('1H')} "
-        f"15M={lower.get('15M')} "
-        f"agreement="
-        f"{alignment['lower_agreement']}/3"
-    )
-
-    # --------------------------------------------------------
-    # CURRENT SETUP STATE
-    # --------------------------------------------------------
-
-    setup = get_setup(
-        target
-    )
-
-    # --------------------------------------------------------
-    # IF NO ACTIVE SPIKE:
-    # SEARCH FOR ONE
-    # --------------------------------------------------------
-
-    if not setup:
-
-        candidate = detect_recent_spike(
-            data["5M"],
-            direction
-        )
-
-        if candidate:
-
-            setup = create_spike_state(
-                data["5M"],
-                candidate,
-                direction
+            print(
+                f"{target} - unsupported target"
             )
 
-            store_setup(
+            return
+
+        # ----------------------------------------------------
+        # Spike
+        # ----------------------------------------------------
+
+        spike = detect_spike(
+            df_15m,
+            expected_direction
+        )
+
+        if spike is None:
+
+            print(
+                f"{target} NO SPIKE"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Pullback
+        # ----------------------------------------------------
+
+        pullback = analyze_pullback(
+            df_15m,
+            spike,
+            expected_direction
+        )
+
+        if pullback is None:
+
+            print(
+                f"{target} NO PULLBACK DATA"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Save setup
+        # ----------------------------------------------------
+
+        if pullback["phase"] in [
+            "WAITING_FOR_PULLBACK",
+            "PULLBACK",
+        ]:
+
+            save_setup(
                 target,
-                setup
+                expected_direction,
+                spike
             )
 
-            save_state(
-                STATE
+        # ----------------------------------------------------
+        # Alignment
+        # ----------------------------------------------------
+
+        alignment = get_alignment(
+            df_12h,
+            df_4h,
+            df_1h,
+            df_15m,
+            df_5m,
+            expected_direction
+        )
+
+        print(
+            f"{target} ALIGNMENT "
+            f"12H={alignment['h12_ok']} "
+            f"4H={alignment['4H']} "
+            f"1H={alignment['1H']} "
+            f"15M={alignment['15M']} "
+            f"5M={alignment['5M']} "
+            f"lower={alignment['lower_agreement']}/3"
+        )
+
+        # ----------------------------------------------------
+        # If pullback is still developing
+        # ----------------------------------------------------
+
+        if pullback["phase"] == "WAITING_FOR_PULLBACK":
+
+            print(
+                f"{target} "
+                f"PULLBACK WAITING "
+                f"age={pullback['age']} "
+                f"pullback="
+                f"{pullback['pullback_atr']:.2f} ATR"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Expired / invalid setup
+        # ----------------------------------------------------
+
+        if pullback["phase"] in [
+            "EXPIRED",
+            "PULLBACK_TOO_DEEP",
+            "CONTINUATION_TOO_STRONG",
+        ]:
+
+            clear_setup(
+                target,
+                expected_direction
             )
 
             print(
-                f"{target} NEW SPIKE "
-                f"size="
-                f"{candidate['move_atr']:.2f} ATR "
-                f"bars="
-                f"{candidate['bars']}"
+                f"{target} "
+                f"SETUP INVALID: "
+                f"{pullback['phase']}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Need actual pullback
+        # ----------------------------------------------------
+
+        if pullback["phase"] != "PULLBACK":
+
+            print(
+                f"{target} "
+                f"WAITING - "
+                f"{pullback['phase']}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Direction protection
+        # ----------------------------------------------------
+
+        if not alignment["h12_ok"]:
+
+            print(
+                f"{target} BLOCKED - "
+                f"12H does not agree"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Lower timeframe agreement
+        # ----------------------------------------------------
+
+        if not alignment["lower_ok"]:
+
+            print(
+                f"{target} BLOCKED - "
+                f"lower TF agreement "
+                f"{alignment['lower_agreement']}/3"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # 5M trigger
+        # ----------------------------------------------------
+
+        trigger, trigger_reason = (
+            five_minute_trigger(
+                df_5m,
+                expected_direction
+            )
+        )
+
+        if not trigger:
+
+            print(
+                f"{target} PULLBACK READY - "
+                f"WAITING FOR 5M: "
+                f"{trigger_reason}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # 5M direction must agree
+        # ----------------------------------------------------
+
+        if not alignment["five_ok"]:
+
+            print(
+                f"{target} "
+                f"5M trigger rejected - "
+                f"5M direction not aligned"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Score
+        # ----------------------------------------------------
+
+        score = calculate_score(
+            expected_direction,
+            alignment,
+            pullback,
+            trigger
+        )
+
+        # ----------------------------------------------------
+        # Current price
+        # ----------------------------------------------------
+
+        last_5m = df_5m.iloc[-1]
+
+        price = float(
+            last_5m["close"]
+        )
+
+        rsi_5m = float(
+            last_5m["rsi"]
+        )
+
+        candle_time = last_5m["time"]
+
+        # ----------------------------------------------------
+        # Duplicate protection
+        # ----------------------------------------------------
+
+        if DUPLICATE_PROTECTION:
+
+            if already_alerted(
+                target,
+                expected_direction,
+                candle_time
+            ):
+
+                print(
+                    f"{target} "
+                    f"DUPLICATE SIGNAL BLOCKED"
+                )
+
+                return
+
+        # ----------------------------------------------------
+        # Final alert
+        # ----------------------------------------------------
+
+        message = build_signal_message(
+            target=target,
+            symbol=symbol,
+            expected_direction=expected_direction,
+            score=score,
+            price=price,
+            spike=spike,
+            pullback=pullback,
+            alignment=alignment,
+            trigger_reason=trigger_reason,
+            rsi_5m=rsi_5m,
+        )
+
+        print(
+            f"{target} SIGNAL READY"
+        )
+
+        sent = send_telegram(
+            message
+        )
+
+        if sent:
+
+            mark_alerted(
+                target,
+                expected_direction,
+                candle_time
+            )
+
+            print(
+                f"{target} TELEGRAM SENT"
             )
 
         else:
 
             print(
-                f"{target} WAITING FOR SPIKE"
+                f"{target} TELEGRAM FAILED"
             )
 
-            return
-
-    # --------------------------------------------------------
-    # ANALYSE ACTIVE SETUP
-    # --------------------------------------------------------
-
-    structure = analyse_active_setup(
-        data["5M"],
-        setup,
-        direction
-    )
-
-    # Add original spike size if missing
-    structure[
-        "spike_size_atr"
-    ] = setup.get(
-        "spike_size_atr",
-        0
-    )
-
-    structure[
-        "spike_body_atr"
-    ] = setup.get(
-        "spike_body_atr",
-        0
-    )
-
-    phase = structure.get(
-        "phase"
-    )
-
-    print(
-        f"{target} STRUCTURE "
-        f"phase={phase} "
-        f"age={structure.get('age')} "
-        f"spike="
-        f"{setup.get('spike_size_atr', 0):.2f} "
-        f"ATR "
-        f"pullback="
-        f"{structure.get('pullback_atr', 0):.2f} ATR"
-    )
-
-    # --------------------------------------------------------
-    # INVALID SETUP
-    # --------------------------------------------------------
-
-    if not structure.get(
-        "valid",
-        False
-    ):
+    except Exception as e:
 
         print(
-            f"{target} SETUP RESET "
-            f"reason={phase}"
+            f"{target} ERROR: {e}"
         )
 
-        clear_setup(
-            target
-        )
-
-        save_state(
-            STATE
-        )
-
-        # Search immediately for another recent spike.
-        candidate = detect_recent_spike(
-            data["5M"],
-            direction
-        )
-
-        if candidate:
-
-            new_setup = create_spike_state(
-                data["5M"],
-                candidate,
-                direction
-            )
-
-            store_setup(
-                target,
-                new_setup
-            )
-
-            save_state(
-                STATE
-            )
-
-            print(
-                f"{target} REPLACED SPIKE "
-                f"size="
-                f"{candidate['move_atr']:.2f} ATR"
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # 5M TRIGGER
-    # --------------------------------------------------------
-
-    five_trigger, five_rsi = (
-        five_minute_trigger(
-            data["5M"],
-            direction
-        )
-    )
-
-    print(
-        f"{target} 5M "
-        f"trigger={five_trigger} "
-        f"RSI={five_rsi:.1f}"
-    )
-
-    # --------------------------------------------------------
-    # ONLY ENTRY PHASES CAN BECOME SIGNALS
-    # --------------------------------------------------------
-
-    ready_phase = phase in [
-        "PULLBACK_WEAKENING",
-        "CONTROLLED_REVERSAL",
-    ]
-
-    if not ready_phase:
-
-        if phase in [
-            "WAITING_FOR_PULLBACK",
-            "SPIKE_DETECTED",
-            "WAITING_FOR_CONTROLLED_REVERSAL",
-            "PULLBACK_STALE",
-            "PULLBACK_BUT_CANDLE_TOO_LARGE",
-        ]:
-
-            print(
-                f"{target} WAITING "
-                f"phase={phase}"
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # HARD HTF PROTECTION
-    # --------------------------------------------------------
-
-    if not alignment[
-        "h12_ok"
-    ]:
-
-        print(
-            f"{target} BLOCKED "
-            f"- 12H regime does not agree "
-            f"with {direction}"
-        )
-
-        return
-
-    if not alignment[
-        "lower_ok"
-    ]:
-
-        print(
-            f"{target} BLOCKED "
-            f"- only "
-            f"{alignment['lower_agreement']}/3 "
-            f"lower HTFs agree"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 5M ENTRY
-    # --------------------------------------------------------
-
-    if REQUIRE_5M_TRIGGER and not five_trigger:
-
-        print(
-            f"{target} BLOCKED "
-            f"- 5M trigger not ready"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    score = calculate_score(
-        structure,
-        alignment,
-        five_trigger
-    )
-
-    print(
-        f"{target} TECHNICAL SCORE "
-        f"{score}/10"
-    )
-
-    if score < SIGNAL_MIN:
-
-        print(
-            f"{target} BELOW SIGNAL SCORE"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # DUPLICATE CONTROL
-    # --------------------------------------------------------
-
-    candle_time = (
-        data["5M"]
-        .iloc[-1]["time"]
-        .isoformat()
-    )
-
-    if was_sent(
-        target,
-        candle_time
-    ):
-
-        print(
-            f"{target} DUPLICATE "
-            f"already sent"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # GROQ ADVISORY
-    # --------------------------------------------------------
-
-    groq = groq_review(
-        target,
-        direction,
-        score,
-        structure,
-        alignment,
-        five_trigger,
-    )
-
-    print(
-        f"{target} GROQ "
-        f"{groq['decision']} "
-        f"{groq['confidence']}%"
-    )
-
-    # IMPORTANT:
-    # Groq does NOT veto a technically valid signal.
-    # It is advisory only.
-
-    message = build_signal_message(
-        target,
-        direction,
-        score,
-        structure,
-        alignment,
-        five_rsi,
-        groq,
-    )
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
-
-    sent = send_telegram(
-        message
-    )
-
-    if sent:
-
-        mark_sent(
-            target,
-            candle_time
-        )
-
-        # Clear setup after signal so it doesn't fire again.
-        clear_setup(
-            target
-        )
-
-        save_state(
-            STATE
-        )
-
-        print(
-            f"{target} >>> SIGNAL SENT <<<"
-        )
-
-    else:
-
-        print(
-            f"{target} TELEGRAM FAILED"
-        )
+        traceback.print_exc()
 
 
 # ============================================================
-# CLEAN OLD SETUPS
+# FULL SCAN
 # ============================================================
 
-def clean_old_setups():
-    """
-    Prevent permanently stuck states.
-    """
+def run_scan(symbols):
 
-    remove = []
+    started = time.time()
 
-    for target, setup in STATE[
-        "setups"
-    ].items():
-
-        try:
-            created = setup.get(
-                "created_at"
-            )
-
-            if not created:
-                remove.append(target)
-                continue
-
-            created_dt = datetime.fromisoformat(
-                created
-            )
-
-            age_seconds = (
-                now_utc()
-                - created_dt
-            ).total_seconds()
-
-            # Maximum life of a setup:
-            # roughly 20 minutes.
-            if age_seconds > 20 * 60:
-                remove.append(target)
-
-        except Exception:
-            remove.append(target)
-
-    for target in remove:
-        STATE["setups"].pop(
-            target,
-            None
-        )
-
-    if remove:
-        save_state(
-            STATE
-        )
-
-
-# ============================================================
-# MAIN SCAN
-# ============================================================
-
-def scan_cycle(symbol_map):
-    print("")
-    print("=" * 65)
+    print()
+    print("=" * 60)
     print(
-        f"STARTING SCAN CYCLE "
-        f"{datetime.now(timezone.utc).isoformat()}"
+        f"STARTING SCAN "
+        f"{utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
     print(
         f"VERSION: {VERSION}"
     )
-    print("=" * 65)
-
-    clean_old_setups()
+    print("=" * 60)
 
     for target in TARGETS:
 
-        symbol = symbol_map.get(
-            target
-        )
+        symbol = symbols.get(target)
 
         if not symbol:
 
             print(
-                f"{target} "
-                f"NO SYMBOL MAPPING"
+                f"{target} SKIPPED - "
+                f"symbol not discovered"
             )
 
             continue
 
-        try:
+        scan_one(
+            target,
+            symbol
+        )
 
-            scan_one(
-                target,
-                symbol
-            )
+    elapsed = time.time() - started
 
-        except Exception as e:
-
-            print(
-                f"{target} SCAN ERROR:",
-                e
-            )
-
-            traceback.print_exc()
-
-    save_state(
-        STATE
-    )
-
-    print("")
+    print("=" * 60)
     print(
-        "CYCLE FINISHED"
+        f"CYCLE FINISHED "
+        f"in {elapsed:.1f} seconds"
     )
+    print("=" * 60)
 
 
 # ============================================================
-# STARTUP CHECK
+# MAIN LOOP
 # ============================================================
 
-def startup_check():
-
-    print("")
-    print("=" * 65)
-    print(
-        "DERIV CRASH/BOOM PULLBACK SCANNER"
-    )
-    print(
-        f"VERSION: {VERSION}"
-    )
-    print("=" * 65)
+def main():
 
     print(
-        f"Scan interval: "
-        f"{SCAN_INTERVAL_SECONDS}s"
+        f"SCAN INTERVAL: "
+        f"{SCAN_INTERVAL_SECONDS} seconds"
     )
 
     print(
-        f"Targets: "
-        f"{len(TARGETS)}"
+        f"DERIV ENDPOINT: "
+        f"{PUBLIC_WS_URL}"
     )
 
-    print(
-        "Automatic trading: DISABLED"
-    )
-
-    print(
-        "Crash direction: SELL only"
-    )
-
-    print(
-        "Boom direction: BUY only"
-    )
-
-    print(
-        "12H filter: 2-of-3 broad regime"
-    )
-
-    print(
-        "Lower HTFs: 2-of-3"
-    )
-
-    print(
-        "5M: entry trigger"
-    )
-
-    print(
-        f"Signal minimum: "
-        f"{SIGNAL_MIN}/10"
-    )
+    # --------------------------------------------------------
+    # Telegram test
+    # --------------------------------------------------------
 
     if not TELEGRAM_BOT_TOKEN:
         print(
@@ -2686,44 +2135,46 @@ def startup_check():
             "WARNING: TELEGRAM_CHAT_ID missing"
         )
 
-    if not GROQ_API_KEY:
-        print(
-            "INFO: GROQ_API_KEY not configured "
-            "- AI review disabled"
-        )
+    # --------------------------------------------------------
+    # Discover symbols
+    # --------------------------------------------------------
 
-    print("=" * 65)
-    print("")
+    while True:
 
+        try:
 
-# ============================================================
-# PROGRAM
-# ============================================================
+            symbols = discover_symbols()
 
-def main():
+            break
 
-    startup_check()
+        except Exception as e:
 
-    symbol_map = get_symbol_map()
-
-    if not symbol_map:
-
-        print(
-            "ERROR: Could not discover "
-            "Crash/Boom symbols."
-        )
-
-        # Retry later instead of killing Railway.
-        while True:
-
-            time.sleep(
-                60
+            print(
+                "SYMBOL DISCOVERY ERROR:",
+                e
             )
 
-            symbol_map = get_symbol_map()
+            print(
+                "Retrying in 30 seconds..."
+            )
 
-            if symbol_map:
-                break
+            time.sleep(30)
+
+    print()
+    print("SYMBOL MAP:")
+
+    for target in TARGETS:
+
+        print(
+            f"  {target}: "
+            f"{symbols.get(target, 'NOT FOUND')}"
+        )
+
+    print()
+
+    # --------------------------------------------------------
+    # Continuous scanning
+    # --------------------------------------------------------
 
     while True:
 
@@ -2731,68 +2182,43 @@ def main():
 
         try:
 
-            # Refresh mapping occasionally.
-            if (
-                not symbol_map
-                or
-                len(symbol_map)
-                < len(TARGETS)
-            ):
-                new_map = discover_symbols()
-
-                if new_map:
-                    symbol_map = new_map
-                    STATE[
-                        "symbol_map"
-                    ] = new_map
-
-                    save_state(
-                        STATE
-                    )
-
-            scan_cycle(
-                symbol_map
+            run_scan(
+                symbols
             )
 
         except Exception as e:
 
             print(
-                "MAIN LOOP ERROR:",
+                "SCAN CYCLE ERROR:",
                 e
             )
 
             traceback.print_exc()
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Don't sleep 300 seconds AFTER a 28-second cycle.
-        # That makes the actual cycle ~328 seconds.
-        #
-        # Instead, keep the cycle interval approximately
-        # equal to SCAN_INTERVAL_SECONDS.
-        # ----------------------------------------------------
-
         elapsed = (
-            time.time()
-            - cycle_start
+            time.time() -
+            cycle_start
         )
 
-        sleep_for = max(
+        sleep_time = max(
             5,
-            SCAN_INTERVAL_SECONDS
-            - elapsed
+            SCAN_INTERVAL_SECONDS -
+            elapsed
         )
 
         print(
             f"Next scan in "
-            f"{sleep_for:.1f} seconds"
+            f"{sleep_time:.0f} seconds"
         )
 
         time.sleep(
-            sleep_for
+            sleep_time
         )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
