@@ -1,102 +1,130 @@
+# ============================================================
+# DERIV CRASH / BOOM PULLBACK SCANNER
+# VERSION: 2026-09-BALANCED-PULLBACK-V2
+#
+# IMPORTANT:
+# - SCANNER ONLY
+# - NO AUTOMATIC TRADING
+# - Telegram alerts only
+#
+# CRASH  -> SELL setups only
+# BOOM   -> BUY setups only
+#
+# Strategy:
+#   Spike -> Pullback -> Weakening -> Controlled reversal
+#
+# Higher timeframe:
+#   12H = broad regime filter
+#   4H/1H/15M = 2-of-3 confirmation
+#   5M = entry trigger
+#
+# ============================================================
+
 import os
 import json
 import time
-import logging
-from datetime import timezone
+import math
+import traceback
+from datetime import datetime, timezone
 
-import pandas as pd
 import requests
-from websocket import create_connection
+import pandas as pd
+import numpy as np
 
 try:
-    from groq import Groq
+    import websocket
 except ImportError:
-    Groq = None
+    websocket = None
 
 
 # ============================================================
-# CONFIG
+# VERSION
+# ============================================================
+
+VERSION = "2026-09-BALANCED-PULLBACK-V2"
+
+
+# ============================================================
+# ENVIRONMENT
 # ============================================================
 
 DERIV_WS_URL = os.getenv(
     "DERIV_WS_URL",
-    "wss://api.derivws.com/trading/v1/options/ws/public"
+    "wss://ws.binaryws.com/websockets/v3"
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-)
-
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY",
-    ""
-)
-
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "openai/gpt-oss-120b"
 )
 
+# IMPORTANT:
+# 60 seconds is recommended because the actual entry is on 5M.
 SCAN_INTERVAL_SECONDS = int(
-    os.getenv(
-        "SCAN_INTERVAL_SECONDS",
-        "300"
-    )
+    os.getenv("SCAN_INTERVAL_SECONDS", "60")
 )
+
+STATE_FILE = "state.json"
 
 
 # ============================================================
 # TARGETS
 # ============================================================
 
-TARGET_NAMES = {
-    "CRASH 300": [
-        "Crash 300",
-        "Crash 300 Index"
-    ],
-    "CRASH 500": [
-        "Crash 500",
-        "Crash 500 Index"
-    ],
-    "CRASH 600": [
-        "Crash 600",
-        "Crash 600 Index"
-    ],
-    "CRASH 900": [
-        "Crash 900",
-        "Crash 900 Index"
-    ],
-    "CRASH 1000": [
-        "Crash 1000",
-        "Crash 1000 Index"
-    ],
-    "BOOM 300": [
-        "Boom 300",
-        "Boom 300 Index"
-    ],
-    "BOOM 500": [
-        "Boom 500",
-        "Boom 500 Index"
-    ],
-    "BOOM 600": [
-        "Boom 600",
-        "Boom 600 Index"
-    ],
-    "BOOM 900": [
-        "Boom 900",
-        "Boom 900 Index"
-    ],
-    "BOOM 1000": [
-        "Boom 1000",
-        "Boom 1000 Index"
-    ],
-}
+TARGETS = [
+    "CRASH 300",
+    "CRASH 500",
+    "CRASH 600",
+    "CRASH 900",
+    "CRASH 1000",
+
+    "BOOM 300",
+    "BOOM 500",
+    "BOOM 600",
+    "BOOM 900",
+    "BOOM 1000",
+]
+
+
+# ============================================================
+# STRATEGY SETTINGS
+# ============================================================
+
+# Spike detection
+SPIKE_MIN_ATR = 1.20
+SPIKE_MAX_LOOKBACK_BARS = 3
+
+# Spike must have meaningful directional movement
+SPIKE_MIN_BODY_ATR = 0.55
+
+# How long a spike remains usable
+MAX_SPIKE_AGE_BARS = 8
+
+# Pullback
+PULLBACK_MIN_ATR = 0.15
+PULLBACK_MAX_ATR = 1.80
+
+# Pullback extreme should not become ancient
+MAX_PULLBACK_AGE_BARS = 4
+
+# Reversal candle protection
+MAX_REVERSAL_ATR = 1.80
+
+# Early entry
+ENTRY_ON_WEAKENING = True
+
+# Minimum score
+SIGNAL_MIN = 8
+
+# 5M trigger must agree with desired direction
+REQUIRE_5M_TRIGGER = True
+
+# HTF confirmation
+LOWER_TF_REQUIRED = 2
 
 
 # ============================================================
@@ -112,1680 +140,1368 @@ TIMEFRAMES = {
 
 
 # ============================================================
-# INDICATORS
+# HTTP SESSION
 # ============================================================
 
-EMA_FAST = 20
-EMA_SLOW = 50
+HTTP = requests.Session()
 
-RSI_LEN = 14
-ATR_LEN = 14
-
-ST_ATR_LEN = 10
-ST_FACTOR = 3.0
-
-
-# ============================================================
-# SPIKE / PULLBACK SETTINGS
-# ============================================================
-
-# Minimum size of the original synthetic spike.
-SPIKE_ATR_MULT = 1.20
-
-# Search this many recent completed M5 candles.
-SPIKE_LOOKBACK = 20
-
-# Spike cannot be too old.
-MAX_SPIKE_AGE_BARS = 10
-
-# Genuine pullback range.
-PULLBACK_MIN_ATR = 0.20
-PULLBACK_MAX_ATR = 1.50
-
-# IMPORTANT:
-# The reversal candle cannot itself be another huge spike.
-MAX_REVERSAL_ATR = 1.25
-
-# Pullback should not already have travelled almost all
-# the way back through the spike.
-MAX_PULLBACK_RETRACE = 0.80
-
-# Number of candles used to judge whether the pullback
-# is weakening.
-WEAKENING_LOOKBACK = 4
-
-# A weakening pullback candle should generally be smaller
-# than the original spike.
-MAX_PULLBACK_CANDLE_ATR = 1.40
-
-
-# ============================================================
-# SIGNAL SETTINGS
-# ============================================================
-
-# Structure itself can score up to 10.
-SIGNAL_MIN = 8
-
-WATCH_MIN = 6
-
-STATE_FILE = "state.json"
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-LOG_LEVEL = os.getenv(
-    "LOG_LEVEL",
-    "INFO"
-).upper()
-
-logging.basicConfig(
-    level=getattr(
-        logging,
-        LOG_LEVEL,
-        logging.INFO
-    ),
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-log = logging.getLogger(
-    "synthetic-scanner"
-)
+HTTP.headers.update({
+    "User-Agent": "Deriv-Pullback-Scanner/2026"
+})
 
 
 # ============================================================
 # STATE
 # ============================================================
 
+def default_state():
+    return {
+        "version": VERSION,
+        "setups": {},
+        "sent": {},
+        "symbol_map": {},
+    }
+
+
 def load_state():
-
     try:
+        if not os.path.exists(STATE_FILE):
+            return default_state()
 
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
 
-            return json.load(f)
+        if not isinstance(state, dict):
+            return default_state()
 
-    except Exception:
+        # Old scanner states are deliberately discarded.
+        # This prevents old setup structures from interfering
+        # with this new strategy.
+        if state.get("version") != VERSION:
+            print("STATE VERSION CHANGED -> RESETTING OLD SETUPS")
+            return default_state()
 
-        return {}
+        state.setdefault("setups", {})
+        state.setdefault("sent", {})
+        state.setdefault("symbol_map", {})
+
+        return state
+
+    except Exception as e:
+        print("STATE LOAD ERROR:", e)
+        return default_state()
 
 
 def save_state(state):
+    try:
+        tmp = STATE_FILE + ".tmp"
 
-    temp_file = STATE_FILE + ".tmp"
-
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            indent=2
-        )
-
-    os.replace(
-        temp_file,
-        STATE_FILE
-    )
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN missing"
-        )
-
-    if not TELEGRAM_CHAT_ID:
-
-        raise RuntimeError(
-            "TELEGRAM_CHAT_ID missing"
-        )
-
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}"
-        "/sendMessage"
-    )
-
-    response = requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        },
-        timeout=20
-    )
-
-    if not response.ok:
-
-        raise RuntimeError(
-            f"Telegram HTTP error "
-            f"{response.status_code}: "
-            f"{response.text}"
-        )
-
-    result = response.json()
-
-    if not result.get("ok"):
-
-        raise RuntimeError(
-            result.get(
-                "description",
-                "Telegram error"
-            )
-        )
-
-    return result
-
-
-# ============================================================
-# DERIV REQUEST
-# ============================================================
-
-def deriv_request(ws, payload):
-
-    ws.send(
-        json.dumps(payload)
-    )
-
-    while True:
-
-        raw = ws.recv()
-
-        data = json.loads(raw)
-
-        if data.get("error"):
-
-            error = data["error"]
-
-            raise RuntimeError(
-                error.get(
-                    "message",
-                    "Deriv API error"
-                )
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                state,
+                f,
+                indent=2,
+                default=str
             )
 
-        return data
+        os.replace(tmp, STATE_FILE)
+
+    except Exception as e:
+        print("STATE SAVE ERROR:", e)
+
+
+STATE = load_state()
 
 
 # ============================================================
-# ACTIVE SYMBOLS
+# BASIC HELPERS
 # ============================================================
 
-def get_active_symbols():
+def now_utc():
+    return datetime.now(timezone.utc)
 
-    ws = create_connection(
+
+def iso_now():
+    return now_utc().isoformat()
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def direction_label(direction):
+    if direction == "BUY":
+        return "BULLISH"
+    if direction == "SELL":
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def opposite(direction):
+    return "SELL" if direction == "BUY" else "BUY"
+
+
+# ============================================================
+# DERIV WEBSOCKET
+# ============================================================
+
+def ws_connect():
+    if websocket is None:
+        raise RuntimeError(
+            "websocket-client is not installed"
+        )
+
+    ws = websocket.create_connection(
         DERIV_WS_URL,
         timeout=20
     )
 
+    return ws
+
+
+# ============================================================
+# ACTIVE SYMBOL DISCOVERY
+# ============================================================
+
+def normalise_name(value):
+    return (
+        str(value)
+        .upper()
+        .replace("_", " ")
+        .replace("-", " ")
+        .replace("/", " ")
+        .replace("INDEX", "")
+    )
+
+
+def target_matches(display_name, target):
+    a = normalise_name(display_name)
+    b = normalise_name(target)
+
+    # Remove repeated whitespace
+    a = " ".join(a.split())
+    b = " ".join(b.split())
+
+    return b in a or a in b
+
+
+def discover_symbols():
+    """
+    Find the actual Deriv symbols corresponding to:
+      CRASH 300
+      CRASH 500
+      ...
+      BOOM 1000
+    """
+
     try:
+        ws = ws_connect()
 
-        data = deriv_request(
-            ws,
-            {
-                "active_symbols": "brief",
-                "req_id": 1
-            }
-        )
+        request = {
+            "active_symbols": "brief",
+            "product_type": "basic",
+        }
 
-    finally:
+        ws.send(json.dumps(request))
+
+        response = json.loads(ws.recv())
 
         ws.close()
 
-    active = data.get(
-        "active_symbols",
-        []
-    )
-
-    found = {}
-
-    for item in active:
-
-        display_name = str(
-            item.get(
-                "display_name",
-                ""
+        if response.get("error"):
+            raise RuntimeError(
+                response["error"].get("message", "active_symbols error")
             )
-        )
 
-        underlying_name = str(
-            item.get(
-                "underlying_symbol_name",
-                ""
+        symbols = response.get("active_symbols", [])
+
+        found = {}
+
+        for item in symbols:
+            symbol = item.get("symbol")
+            display = (
+                item.get("display_name")
+                or item.get("name")
+                or ""
             )
-        )
 
-        symbol = (
-            item.get(
-                "underlying_symbol"
-            )
-            or
-            item.get(
-                "symbol"
-            )
-        )
+            if not symbol:
+                continue
 
-        if not symbol:
-            continue
+            for target in TARGETS:
+                if target in found:
+                    continue
 
-        candidates = [
-            display_name,
-            underlying_name
-        ]
+                if target_matches(display, target):
+                    found[target] = symbol
 
-        for target, aliases in TARGET_NAMES.items():
+        # Sometimes display_name is not exactly what we expect.
+        # Try a second flexible matching pass.
+        for target in TARGETS:
+            if target in found:
+                continue
 
-            matched = False
+            target_norm = normalise_name(target)
 
-            for candidate in candidates:
+            for item in symbols:
+                symbol = item.get("symbol")
+                display = normalise_name(
+                    item.get("display_name")
+                    or item.get("name")
+                    or ""
+                )
 
-                normalized = (
-                    " ".join(
-                        candidate.upper().split()
+                digits = "".join(
+                    c for c in target_norm
+                    if c.isdigit()
+                )
+
+                if (
+                    digits
+                    and digits in display
+                    and (
+                        "CRASH" in target_norm
+                        and "CRASH" in display
+                        or
+                        "BOOM" in target_norm
+                        and "BOOM" in display
+                    )
+                ):
+                    found[target] = symbol
+                    break
+
+        if found:
+            print("SYMBOL MAP:")
+            for k, v in found.items():
+                print(f"  {k} -> {v}")
+
+        else:
+            print("WARNING: NO TARGET SYMBOLS FOUND")
+
+        return found
+
+    except Exception as e:
+        print("SYMBOL DISCOVERY ERROR:", e)
+        return {}
+
+
+def get_symbol_map():
+    existing = STATE.get("symbol_map", {})
+
+    if len(existing) >= len(TARGETS):
+        return existing
+
+    fresh = discover_symbols()
+
+    if fresh:
+        STATE["symbol_map"] = fresh
+        save_state(STATE)
+
+    return fresh
+
+
+# ============================================================
+# CANDLE DATA
+# ============================================================
+
+def get_candles(symbol, granularity, count=200):
+    """
+    Fetch completed candles from Deriv.
+
+    Uses one websocket connection for one request.
+    """
+
+    ws = None
+
+    try:
+        ws = ws_connect()
+
+        request = {
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": count,
+            "end": "latest",
+            "style": "candles",
+            "granularity": granularity,
+            "subscribe": 0,
+        }
+
+        ws.send(json.dumps(request))
+
+        while True:
+            raw = ws.recv()
+
+            if not raw:
+                continue
+
+            response = json.loads(raw)
+
+            if response.get("error"):
+                raise RuntimeError(
+                    response["error"].get(
+                        "message",
+                        "Deriv candle error"
                     )
                 )
 
-                if target in normalized:
-
-                    found[target] = symbol
-                    matched = True
-                    break
-
-                for alias in aliases:
-
-                    alias_normalized = (
-                        " ".join(
-                            alias.upper().split()
-                        )
-                    )
-
-                    if alias_normalized in normalized:
-
-                        found[target] = symbol
-                        matched = True
-                        break
-
-                if matched:
-                    break
-
-            if matched:
+            if response.get("msg_type") == "candles":
+                candles = response.get("candles", [])
                 break
 
-    return found
-
-
-# ============================================================
-# GET CANDLES
-# ============================================================
-
-def get_candles(
-    symbol,
-    granularity,
-    count=250
-):
-
-    ws = create_connection(
-        DERIV_WS_URL,
-        timeout=30
-    )
-
-    try:
-
-        data = deriv_request(
-            ws,
-            {
-                "ticks_history": symbol,
-                "end": "latest",
-                "count": count,
-                "style": "candles",
-                "granularity": granularity,
-                "req_id": 2
-            }
-        )
-
-    finally:
-
-        ws.close()
-
-    candles = data.get(
-        "candles",
-        []
-    )
-
-    if not candles:
-
-        raise RuntimeError(
-            f"No candles returned for {symbol}"
-        )
-
-    df = pd.DataFrame(
-        candles
-    )
-
-    required = [
-        "epoch",
-        "open",
-        "high",
-        "low",
-        "close"
-    ]
-
-    for column in required:
-
-        if column not in df.columns:
-
+        if not candles:
             raise RuntimeError(
-                f"Missing candle field: {column}"
+                f"No candles returned for {symbol} {granularity}"
             )
 
-    df["epoch"] = pd.to_numeric(
-        df["epoch"],
-        errors="coerce"
-    )
+        rows = []
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close"
-    ]:
+        for c in candles:
+            try:
+                epoch = int(c["epoch"])
 
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
+                rows.append({
+                    "time": pd.to_datetime(
+                        epoch,
+                        unit="s",
+                        utc=True
+                    ),
+                    "open": float(c["open"]),
+                    "high": float(c["high"]),
+                    "low": float(c["low"]),
+                    "close": float(c["close"]),
+                })
+
+            except Exception:
+                continue
+
+        if not rows:
+            raise RuntimeError(
+                f"No valid candles for {symbol}"
+            )
+
+        df = pd.DataFrame(rows)
+
+        df = df.dropna()
+
+        df = df.sort_values("time")
+
+        df = df.drop_duplicates(
+            subset=["time"]
         )
 
-    df = df.dropna(
-        subset=required
-    )
-
-    df["time"] = pd.to_datetime(
-        df["epoch"],
-        unit="s",
-        utc=True
-    )
-
-    df = (
-        df
-        .drop_duplicates("epoch")
-        .sort_values("epoch")
-        .set_index("time")
-    )
-
-    # --------------------------------------------------------
-    # REMOVE FORMING CANDLE
-    # --------------------------------------------------------
-
-    now = pd.Timestamp.now(
-        tz="UTC"
-    )
-
-    if len(df):
-
-        last_time = df.index[-1]
-
-        age = (
-            now - last_time
-        ).total_seconds()
-
-        if age < granularity:
-
-            df = df.iloc[:-1]
-
-    if len(df) < 80:
-
-        raise RuntimeError(
-            f"Not enough completed candles "
-            f"for {symbol}: {len(df)}"
+        # Remove currently forming candle.
+        current_epoch = int(
+            now_utc().timestamp()
         )
 
-    return df
+        if len(df) > 0:
+            last_epoch = int(
+                df.iloc[-1]["time"].timestamp()
+            )
+
+            if last_epoch + granularity > current_epoch:
+                df = df.iloc[:-1].copy()
+
+        if len(df) < 30:
+            raise RuntimeError(
+                f"Too few completed candles: "
+                f"{symbol} {granularity} "
+                f"{len(df)}"
+            )
+
+        return df.reset_index(drop=True)
+
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 
 # ============================================================
-# BUILD 12H FROM COMPLETED 4H CANDLES
+# INDICATORS
 # ============================================================
 
-def build_12h_from_4h(df_4h):
-
-    result = (
-        df_4h
-        .resample(
-            "12h",
-            origin="epoch",
-            label="left",
-            closed="left"
-        )
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last"
-            }
-        )
-    )
-
-    counts = (
-        df_4h["close"]
-        .resample(
-            "12h",
-            origin="epoch",
-            label="left",
-            closed="left"
-        )
-        .count()
-    )
-
-    result["count"] = counts
-
-    # Only use complete 12H candles.
-    result = result[
-        result["count"] >= 3
-    ]
-
-    result = result.drop(
-        columns=["count"]
-    )
-
-    result = result.dropna()
-
-    if len(result) < 80:
-
-        raise RuntimeError(
-            "Not enough completed 12H candles"
-        )
-
-    return result
-
-
-# ============================================================
-# RMA
-# ============================================================
-
-def rma(
-    series,
-    length
-):
-
+def ema(series, length):
     return series.ewm(
+        span=length,
+        adjust=False
+    ).mean()
+
+
+def atr(df, length=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1
+    ).max(axis=1)
+
+    return tr.ewm(
         alpha=1 / length,
         adjust=False
     ).mean()
 
 
-# ============================================================
-# ATR
-# ============================================================
-
-def atr(
-    df,
-    length=ATR_LEN
-):
-
-    previous_close = (
-        df["close"].shift(1)
-    )
-
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-
-            (
-                df["high"]
-                -
-                previous_close
-            ).abs(),
-
-            (
-                df["low"]
-                -
-                previous_close
-            ).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return rma(
-        tr,
-        length
-    )
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def rsi(
-    series,
-    length=RSI_LEN
-):
-
+def rsi(series, length=14):
     delta = series.diff()
 
-    gain = delta.clip(
-        lower=0
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / length,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / length,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
     )
 
-    loss = -delta.clip(
-        upper=0
+    result = 100 - (
+        100 / (1 + rs)
     )
 
-    avg_gain = rma(
-        gain,
-        length
-    )
-
-    avg_loss = rma(
-        loss,
-        length
-    )
-
-    rs = (
-        avg_gain
-        /
-        avg_loss.replace(
-            0,
-            float("nan")
-        )
-    )
-
-    value = (
-        100
-        -
-        (
-            100
-            /
-            (1 + rs)
-        )
-    )
-
-    return value.fillna(50)
+    return result.fillna(50)
 
 
-# ============================================================
-# SUPERTREND
-# ============================================================
+def supertrend_direction(df, atr_length=10, factor=3.0):
+    """
+    Returns:
+        1  bullish
+       -1  bearish
+        0  unavailable
+    """
 
-def supertrend(
-    df,
-    atr_len=ST_ATR_LEN,
-    factor=ST_FACTOR
-):
+    if len(df) < atr_length + 5:
+        return 0
 
-    a = atr(
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+
+    atr_values = atr(
         df,
-        atr_len
+        atr_length
+    ).values
+
+    upper = (
+        (h + l) / 2
+        + factor * atr_values
     )
 
-    hl2 = (
-        df["high"]
-        +
-        df["low"]
-    ) / 2
-
-    upper_basic = (
-        hl2
-        +
-        factor * a
+    lower = (
+        (h + l) / 2
+        - factor * atr_values
     )
 
-    lower_basic = (
-        hl2
-        -
-        factor * a
-    )
+    final_upper = upper.copy()
+    final_lower = lower.copy()
 
-    upper = upper_basic.copy()
+    trend = np.ones(len(df))
 
-    lower = lower_basic.copy()
-
-    direction = pd.Series(
-        index=df.index,
-        dtype="int64"
-    )
-
-    direction.iloc[0] = 1
-
-    for i in range(
-        1,
-        len(df)
-    ):
+    for i in range(1, len(df)):
 
         if (
-            upper_basic.iloc[i]
-            <
-            upper.iloc[i - 1]
-            or
-            df["close"].iloc[i - 1]
-            >
-            upper.iloc[i - 1]
+            upper[i] < final_upper[i - 1]
+            or c[i - 1] > final_upper[i - 1]
         ):
-
-            upper.iloc[i] = (
-                upper_basic.iloc[i]
-            )
-
+            final_upper[i] = upper[i]
         else:
-
-            upper.iloc[i] = (
-                upper.iloc[i - 1]
-            )
+            final_upper[i] = final_upper[i - 1]
 
         if (
-            lower_basic.iloc[i]
-            >
-            lower.iloc[i - 1]
-            or
-            df["close"].iloc[i - 1]
-            <
-            lower.iloc[i - 1]
+            lower[i] > final_lower[i - 1]
+            or c[i - 1] < final_lower[i - 1]
         ):
-
-            lower.iloc[i] = (
-                lower_basic.iloc[i]
-            )
-
+            final_lower[i] = lower[i]
         else:
+            final_lower[i] = final_lower[i - 1]
 
-            lower.iloc[i] = (
-                lower.iloc[i - 1]
-            )
-
-        if (
-            direction.iloc[i - 1] == -1
-            and
-            df["close"].iloc[i]
-            >
-            upper.iloc[i]
-        ):
-
-            direction.iloc[i] = 1
-
-        elif (
-            direction.iloc[i - 1] == 1
-            and
-            df["close"].iloc[i]
-            <
-            lower.iloc[i]
-        ):
-
-            direction.iloc[i] = -1
-
+        if trend[i - 1] == -1:
+            if c[i] > final_upper[i]:
+                trend[i] = 1
+            else:
+                trend[i] = -1
         else:
+            if c[i] < final_lower[i]:
+                trend[i] = -1
+            else:
+                trend[i] = 1
 
-            direction.iloc[i] = (
-                direction.iloc[i - 1]
-            )
-
-    return direction
+    return int(trend[-1])
 
 
 # ============================================================
-# INDICATOR SNAPSHOT
+# SNAPSHOT
 # ============================================================
 
 def indicator_snapshot(df):
+    if len(df) < 55:
+        return None
 
-    ema20 = (
-        df["close"]
-        .ewm(
-            span=EMA_FAST,
-            adjust=False
+    close = df["close"]
+
+    ema20 = ema(close, 20)
+    ema50 = ema(close, 50)
+
+    atr14 = atr(df, 14)
+
+    st = supertrend_direction(
+        df,
+        10,
+        3.0
+    )
+
+    current = float(close.iloc[-1])
+
+    ema20_now = float(ema20.iloc[-1])
+    ema50_now = float(ema50.iloc[-1])
+
+    # Three broad trend components
+    price_above_ema20 = current > ema20_now
+    ema20_above_ema50 = ema20_now > ema50_now
+
+    if len(ema20) >= 4:
+        ema20_slope_up = (
+            ema20.iloc[-1] > ema20.iloc[-4]
         )
-        .mean()
+    else:
+        ema20_slope_up = False
+
+    bullish_score = sum([
+        price_above_ema20,
+        ema20_above_ema50,
+        ema20_slope_up,
+    ])
+
+    bearish_score = sum([
+        not price_above_ema20,
+        not ema20_above_ema50,
+        not ema20_slope_up,
+    ])
+
+    if bullish_score >= 2:
+        broad_direction = "BULLISH"
+
+    elif bearish_score >= 2:
+        broad_direction = "BEARISH"
+
+    else:
+        broad_direction = "NEUTRAL"
+
+    return {
+        "close": current,
+        "ema20": ema20_now,
+        "ema50": ema50_now,
+        "atr": float(atr14.iloc[-1]),
+        "supertrend": st,
+
+        "price_above_ema20": bool(
+            price_above_ema20
+        ),
+
+        "ema20_above_ema50": bool(
+            ema20_above_ema50
+        ),
+
+        "ema20_slope_up": bool(
+            ema20_slope_up
+        ),
+
+        "bullish_score": int(
+            bullish_score
+        ),
+
+        "bearish_score": int(
+            bearish_score
+        ),
+
+        "direction": broad_direction,
+    }
+
+
+# ============================================================
+# 12H DATA
+# ============================================================
+
+def build_12h_from_4h(df4h):
+    """
+    Build completed 12H candles from completed 4H candles.
+    """
+
+    if len(df4h) < 20:
+        return pd.DataFrame()
+
+    x = df4h.copy()
+
+    x = x.set_index("time")
+
+    result = x.resample(
+        "12h",
+        label="left",
+        closed="left"
+    ).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    })
+
+    result = result.dropna()
+
+    result = result.reset_index()
+
+    # Only accept a fully completed 12H block.
+    current_time = now_utc()
+
+    result = result[
+        result["time"] + pd.Timedelta(
+            hours=12
+        ) <= current_time
+    ]
+
+    return result.reset_index(drop=True)
+
+
+# ============================================================
+# TIMEFRAME DIRECTION
+# ============================================================
+
+def tf_direction(snapshot):
+    """
+    Each timeframe gets a balanced 2-of-3 direction:
+
+    1. price vs EMA20
+    2. EMA20 vs EMA50
+    3. Supertrend
+
+    This avoids requiring every indicator to agree.
+    """
+
+    if not snapshot:
+        return "NEUTRAL"
+
+    bullish = sum([
+        snapshot["price_above_ema20"],
+        snapshot["ema20_above_ema50"],
+        snapshot["supertrend"] == 1,
+    ])
+
+    bearish = sum([
+        not snapshot["price_above_ema20"],
+        not snapshot["ema20_above_ema50"],
+        snapshot["supertrend"] == -1,
+    ])
+
+    if bullish >= 2:
+        return "BULLISH"
+
+    if bearish >= 2:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+# ============================================================
+# SPIKE DETECTION
+# ============================================================
+
+def candle_stats(row):
+    candle_range = max(
+        safe_float(row["high"]) -
+        safe_float(row["low"]),
+        0.0
     )
 
-    ema50 = (
-        df["close"]
-        .ewm(
-            span=EMA_SLOW,
-            adjust=False
-        )
-        .mean()
+    body = abs(
+        safe_float(row["close"]) -
+        safe_float(row["open"])
     )
 
-    rsi_values = rsi(
-        df["close"]
+    return candle_range, body
+
+
+def detect_recent_spike(df5m, desired_direction):
+    """
+    Detect a spike over 1-3 candles.
+
+    CRASH:
+        downward impulse
+
+    BOOM:
+        upward impulse
+    """
+
+    if len(df5m) < 30:
+        return None
+
+    atr_series = atr(
+        df5m,
+        14
     )
 
-    atr_values = atr(
-        df
+    latest = len(df5m) - 1
+
+    # Search recent candles, but don't search indefinitely.
+    start = max(
+        15,
+        latest - 6
     )
 
-    st = supertrend(
-        df
+    candidates = []
+
+    for end_idx in range(
+        start,
+        latest + 1
+    ):
+
+        for bars in range(
+            1,
+            SPIKE_MAX_LOOKBACK_BARS + 1
+        ):
+
+            begin_idx = end_idx - bars + 1
+
+            if begin_idx < 15:
+                continue
+
+            section = df5m.iloc[
+                begin_idx:end_idx + 1
+            ]
+
+            start_price = float(
+                section["open"].iloc[0]
+            )
+
+            end_price = float(
+                section["close"].iloc[-1]
+            )
+
+            move = end_price - start_price
+
+            atr_ref = float(
+                atr_series.iloc[end_idx]
+            )
+
+            if atr_ref <= 0:
+                continue
+
+            total_body = (
+                section["close"]
+                - section["open"]
+            ).abs().sum()
+
+            move_atr = abs(move) / atr_ref
+            body_atr = (
+                float(total_body)
+                / atr_ref
+            )
+
+            if desired_direction == "SELL":
+                correct_move = move < 0
+
+            else:
+                correct_move = move > 0
+
+            if not correct_move:
+                continue
+
+            if move_atr < SPIKE_MIN_ATR:
+                continue
+
+            if body_atr < SPIKE_MIN_BODY_ATR:
+                continue
+
+            # Calculate strongest candle in this impulse.
+            max_single_atr = 0.0
+
+            for j in range(
+                begin_idx,
+                end_idx + 1
+            ):
+                r, b = candle_stats(
+                    df5m.iloc[j]
+                )
+
+                a = float(
+                    atr_series.iloc[j]
+                )
+
+                if a > 0:
+                    max_single_atr = max(
+                        max_single_atr,
+                        r / a
+                    )
+
+            candidates.append({
+                "start_idx": begin_idx,
+                "end_idx": end_idx,
+                "bars": bars,
+                "move_atr": move_atr,
+                "body_atr": body_atr,
+                "max_single_atr": max_single_atr,
+                "time": df5m.iloc[
+                    end_idx
+                ]["time"].isoformat(),
+            })
+
+    if not candidates:
+        return None
+
+    # Strongest / most recent useful candidate
+    candidates.sort(
+        key=lambda x: (
+            x["move_atr"],
+            x["end_idx"]
+        ),
+        reverse=True
     )
 
-    current = df.iloc[-1]
-    previous = df.iloc[-2]
+    return candidates[0]
 
-    ema_bullish = (
-        ema20.iloc[-1]
-        >
-        ema50.iloc[-1]
+
+# ============================================================
+# STATEFUL SETUP DETECTION
+# ============================================================
+
+def setup_key(target):
+    return target
+
+
+def get_setup(target):
+    return STATE["setups"].get(
+        setup_key(target)
     )
 
-    ema_trend = (
-        "BULLISH"
-        if ema_bullish
-        else
-        "BEARISH"
+
+def clear_setup(target):
+    STATE["setups"].pop(
+        setup_key(target),
+        None
     )
 
-    st_direction = (
-        "BULLISH"
-        if st.iloc[-1] == 1
-        else
-        "BEARISH"
+
+def store_setup(target, setup):
+    STATE["setups"][
+        setup_key(target)
+    ] = setup
+
+
+def setup_age(df5m, setup):
+    spike_time = setup.get("spike_time")
+
+    if not spike_time:
+        return 999
+
+    matches = np.where(
+        df5m["time"].astype(str).values
+        == spike_time
+    )[0]
+
+    if len(matches) == 0:
+        return 999
+
+    idx = int(matches[-1])
+
+    return (
+        len(df5m) - 1 - idx
     )
 
-    current_rsi = float(
-        rsi_values.iloc[-1]
+
+def locate_spike_index(df5m, setup):
+    spike_time = setup.get(
+        "spike_time"
+    )
+
+    if not spike_time:
+        return None
+
+    times = df5m["time"].astype(str)
+
+    matches = np.where(
+        times.values == spike_time
+    )[0]
+
+    if len(matches) == 0:
+        return None
+
+    return int(matches[-1])
+
+
+def create_spike_state(
+    df5m,
+    candidate,
+    direction
+):
+    idx = candidate["end_idx"]
+
+    row = df5m.iloc[idx]
+
+    return {
+        "direction": direction,
+        "spike_time": row["time"].isoformat(),
+        "spike_close": float(row["close"]),
+        "spike_high": float(row["high"]),
+        "spike_low": float(row["low"]),
+        "spike_size_atr": float(
+            candidate["move_atr"]
+        ),
+        "spike_body_atr": float(
+            candidate["body_atr"]
+        ),
+        "spike_bars": int(
+            candidate["bars"]
+        ),
+        "created_at": iso_now(),
+        "phase": "SPIKE_DETECTED",
+    }
+
+
+def analyse_active_setup(
+    df5m,
+    setup,
+    direction
+):
+    """
+    Turn an active spike into:
+
+      WAITING_FOR_PULLBACK
+      PULLBACK_WEAKENING
+      CONTROLLED_REVERSAL
+      READY
+    """
+
+    spike_idx = locate_spike_index(
+        df5m,
+        setup
+    )
+
+    if spike_idx is None:
+        return {
+            "valid": False,
+            "phase": "SPIKE_NOT_FOUND"
+        }
+
+    age = (
+        len(df5m) - 1 - spike_idx
+    )
+
+    if age > MAX_SPIKE_AGE_BARS:
+        return {
+            "valid": False,
+            "phase": "SPIKE_TOO_OLD",
+            "age": age,
+        }
+
+    if age < 1:
+        return {
+            "valid": True,
+            "phase": "SPIKE_DETECTED",
+            "age": age,
+        }
+
+    after = df5m.iloc[
+        spike_idx + 1:
+    ].copy()
+
+    if len(after) < 1:
+        return {
+            "valid": True,
+            "phase": "WAITING_FOR_PULLBACK",
+            "age": age,
+        }
+
+    spike_close = float(
+        setup["spike_close"]
+    )
+
+    # --------------------------------------------------------
+    # ATR reference
+    # --------------------------------------------------------
+
+    atr_series = atr(
+        df5m,
+        14
     )
 
     current_atr = float(
-        atr_values.iloc[-1]
+        atr_series.iloc[-1]
     )
+
+    if current_atr <= 0:
+        return {
+            "valid": True,
+            "phase": "WAITING_FOR_PULLBACK",
+            "age": age,
+        }
+
+    # --------------------------------------------------------
+    # PULLBACK
+    # --------------------------------------------------------
+
+    if direction == "SELL":
+
+        pullback_extreme = float(
+            after["high"].max()
+        )
+
+        pullback_distance = (
+            pullback_extreme -
+            spike_close
+        )
+
+        pullback_atr = (
+            pullback_distance /
+            current_atr
+        )
+
+        extreme_positions = np.where(
+            after["high"].values
+            == pullback_extreme
+        )[0]
+
+    else:
+
+        pullback_extreme = float(
+            after["low"].min()
+        )
+
+        pullback_distance = (
+            spike_close -
+            pullback_extreme
+        )
+
+        pullback_atr = (
+            pullback_distance /
+            current_atr
+        )
+
+        extreme_positions = np.where(
+            after["low"].values
+            == pullback_extreme
+        )[0]
+
+    if len(extreme_positions) == 0:
+        return {
+            "valid": True,
+            "phase": "WAITING_FOR_PULLBACK",
+            "age": age,
+        }
+
+    pullback_relative_idx = int(
+        extreme_positions[-1]
+    )
+
+    pullback_age = (
+        len(after) - 1
+        - pullback_relative_idx
+    )
+
+    pullback_exists = (
+        pullback_atr >= PULLBACK_MIN_ATR
+        and
+        pullback_atr <= PULLBACK_MAX_ATR
+    )
+
+    if not pullback_exists:
+
+        if (
+            pullback_atr
+            > PULLBACK_MAX_ATR
+        ):
+            return {
+                "valid": False,
+                "phase": "PULLBACK_TOO_DEEP",
+                "age": age,
+                "pullback_atr": pullback_atr,
+            }
+
+        return {
+            "valid": True,
+            "phase": "WAITING_FOR_PULLBACK",
+            "age": age,
+            "pullback_atr": pullback_atr,
+        }
+
+    # --------------------------------------------------------
+    # PULLBACK TOO OLD
+    # --------------------------------------------------------
+
+    if pullback_age > MAX_PULLBACK_AGE_BARS:
+        return {
+            "valid": True,
+            "phase": "PULLBACK_STALE",
+            "age": age,
+            "pullback_atr": pullback_atr,
+        }
+
+    # --------------------------------------------------------
+    # CURRENT CANDLE
+    # --------------------------------------------------------
+
+    current = df5m.iloc[-1]
+    previous = df5m.iloc[-2]
+
+    current_range, current_body = candle_stats(
+        current
+    )
+
+    previous_range, previous_body = candle_stats(
+        previous
+    )
+
+    current_atr = max(
+        current_atr,
+        1e-9
+    )
+
+    current_size_atr = (
+        current_range /
+        current_atr
+    )
+
+    current_body_atr = (
+        current_body /
+        current_atr
+    )
+
+    # Huge candle = not a controlled entry.
+    if current_size_atr > MAX_REVERSAL_ATR:
+        return {
+            "valid": True,
+            "phase": "PULLBACK_BUT_CANDLE_TOO_LARGE",
+            "age": age,
+            "pullback_atr": pullback_atr,
+            "trigger_size_atr": current_size_atr,
+        }
+
+    # --------------------------------------------------------
+    # REVERSAL DIRECTION
+    # --------------------------------------------------------
+
+    if direction == "SELL":
+
+        reversal_direction = (
+            float(current["close"])
+            < float(current["open"])
+        )
+
+        close_moving_direction = (
+            float(current["close"])
+            < float(previous["close"])
+        )
+
+    else:
+
+        reversal_direction = (
+            float(current["close"])
+            > float(current["open"])
+        )
+
+        close_moving_direction = (
+            float(current["close"])
+            > float(previous["close"])
+        )
+
+    # --------------------------------------------------------
+    # PULLBACK WEAKENING
+    # --------------------------------------------------------
+
+    recent_start = max(
+        spike_idx + 1,
+        len(df5m) - 4
+    )
+
+    recent = df5m.iloc[
+        recent_start:
+    ].copy()
+
+    if len(recent) >= 2:
+
+        bodies = []
+
+        for _, row in recent.iterrows():
+            _, b = candle_stats(row)
+            bodies.append(b)
+
+        # Countertrend body weakening.
+        weakening = (
+            len(bodies) >= 2
+            and
+            bodies[-1] <=
+            bodies[-2]
+        )
+
+    else:
+        weakening = False
+
+    # Another useful condition:
+    # the pullback extreme happened recently and price
+    # has now started moving back in the spike direction.
+    early_turn = (
+        pullback_age <= 2
+        and
+        reversal_direction
+        and
+        close_moving_direction
+    )
+
+    controlled_reversal = (
+        reversal_direction
+        and
+        close_moving_direction
+        and
+        current_size_atr
+        <= MAX_REVERSAL_ATR
+        and
+        current_body_atr >= 0.08
+    )
+
+    if (
+        ENTRY_ON_WEAKENING
+        and
+        (weakening or early_turn)
+        and
+        controlled_reversal
+    ):
+        return {
+            "valid": True,
+            "phase": "PULLBACK_WEAKENING",
+            "age": age,
+            "pullback_atr": pullback_atr,
+            "pullback_age": pullback_age,
+            "trigger_size_atr": current_size_atr,
+            "trigger_body_atr": current_body_atr,
+        }
+
+    if controlled_reversal:
+        return {
+            "valid": True,
+            "phase": "CONTROLLED_REVERSAL",
+            "age": age,
+            "pullback_atr": pullback_atr,
+            "pullback_age": pullback_age,
+            "trigger_size_atr": current_size_atr,
+            "trigger_body_atr": current_body_atr,
+        }
+
+    return {
+        "valid": True,
+        "phase": "WAITING_FOR_CONTROLLED_REVERSAL",
+        "age": age,
+        "pullback_atr": pullback_atr,
+        "pullback_age": pullback_age,
+        "trigger_size_atr": current_size_atr,
+    }
+
+
+# ============================================================
+# 5M ENTRY TRIGGER
+# ============================================================
+
+def five_minute_trigger(df5m, direction):
+    if len(df5m) < 25:
+        return False, 50.0
+
+    close = df5m["close"]
+
+    ema20 = ema(
+        close,
+        20
+    )
+
+    r = rsi(
+        close,
+        14
+    )
+
+    current = df5m.iloc[-1]
+    previous = df5m.iloc[-2]
 
     current_close = float(
         current["close"]
     )
 
-    if current_close != 0:
+    previous_close = float(
+        previous["close"]
+    )
 
-        atr_pct = (
-            current_atr
-            /
-            current_close
-            *
-            100
-        )
+    current_high = float(
+        current["high"]
+    )
+
+    current_low = float(
+        current["low"]
+    )
+
+    previous_high = float(
+        previous["high"]
+    )
+
+    previous_low = float(
+        previous["low"]
+    )
+
+    current_ema = float(
+        ema20.iloc[-1]
+    )
+
+    current_rsi = float(
+        r.iloc[-1]
+    )
+
+    if direction == "SELL":
+
+        # For Crash we want the pullback to start turning down.
+        conditions = [
+            current_close < current_ema,
+            current_close < previous_close,
+            current_close < previous_high,
+            current_low <= previous_low,
+        ]
+
+        score = sum(conditions)
+
+        # Don't demand all 4.
+        trigger = score >= 2
 
     else:
 
-        atr_pct = 0.0
+        conditions = [
+            current_close > current_ema,
+            current_close > previous_close,
+            current_close > previous_low,
+            current_high >= previous_high,
+        ]
 
-    if current_rsi >= 52:
+        score = sum(conditions)
 
-        rsi_bias = "BULLISH"
+        trigger = score >= 2
 
-    elif current_rsi <= 48:
-
-        rsi_bias = "BEARISH"
-
-    else:
-
-        rsi_bias = "NEUTRAL"
-
-    return {
-
-        "close":
-            current_close,
-
-        "ema20":
-            float(
-                ema20.iloc[-1]
-            ),
-
-        "ema50":
-            float(
-                ema50.iloc[-1]
-            ),
-
-        "rsi":
-            current_rsi,
-
-        "atr":
-            current_atr,
-
-        "atr_pct":
-            float(
-                atr_pct
-            ),
-
-        "supertrend":
-            st_direction,
-
-        "ema_trend":
-            ema_trend,
-
-        "rsi_bias":
-            rsi_bias,
-
-        "break_up":
-            bool(
-                current["close"]
-                >
-                previous["high"]
-            ),
-
-        "break_down":
-            bool(
-                current["close"]
-                <
-                previous["low"]
-            ),
-
-        "candle_time":
-            df.index[-1].isoformat()
-    }
-
-
-# ============================================================
-# SYNTHETIC TYPE
-# ============================================================
-
-def synthetic_direction(name):
-
-    value = name.upper()
-
-    if "CRASH" in value:
-        return "CRASH"
-
-    if "BOOM" in value:
-        return "BOOM"
-
-    return None
-
-
-# ============================================================
-# FIND MOST RECENT VALID SPIKE
-# ============================================================
-
-def detect_recent_spike(
-    df,
-    direction
-):
-
-    if len(df) < 60:
-        return None
-
-    atr_values = atr(
-        df,
-        ATR_LEN
-    )
-
-    start = max(
-        1,
-        len(df)
-        -
-        SPIKE_LOOKBACK
-        -
-        1
-    )
-
-    best = None
-
-    for i in range(
-        start,
-        len(df) - 1
-    ):
-
-        candle = df.iloc[i]
-
-        candle_atr = float(
-            atr_values.iloc[i]
-        )
-
-        if candle_atr <= 0:
-            continue
-
-        candle_range = (
-            float(candle["high"])
-            -
-            float(candle["low"])
-        )
-
-        body = abs(
-            float(candle["close"])
-            -
-            float(candle["open"])
-        )
-
-        movement = max(
-            candle_range,
-            body
-        )
-
-        size_atr = (
-            movement
-            /
-            candle_atr
-        )
-
-        if direction == "CRASH":
-
-            valid = (
-                candle["close"]
-                <
-                candle["open"]
-                and
-                size_atr
-                >=
-                SPIKE_ATR_MULT
-            )
-
-        elif direction == "BOOM":
-
-            valid = (
-                candle["close"]
-                >
-                candle["open"]
-                and
-                size_atr
-                >=
-                SPIKE_ATR_MULT
-            )
-
-        else:
-
-            valid = False
-
-        if not valid:
-            continue
-
-        candidate = {
-
-            "index":
-                i,
-
-            "time":
-                df.index[i].isoformat(),
-
-            "open":
-                float(
-                    candle["open"]
-                ),
-
-            "high":
-                float(
-                    candle["high"]
-                ),
-
-            "low":
-                float(
-                    candle["low"]
-                ),
-
-            "close":
-                float(
-                    candle["close"]
-                ),
-
-            "size_atr":
-                float(
-                    size_atr
-                )
-        }
-
-        # Always prefer the newest valid spike.
-        if (
-            best is None
-            or
-            i > best["index"]
-        ):
-
-            best = candidate
-
-    return best
-
-
-# ============================================================
-# CHECK PULLBACK WEAKENING
-# ============================================================
-
-def pullback_is_weakening(
-    df,
-    spike_index,
-    direction
-):
-
-    after = df.iloc[
-        spike_index + 1:
-    ]
-
-    if len(after) < 2:
-        return False
-
-    recent = after.tail(
-        WEAKENING_LOOKBACK
-    )
-
-    atr_values = atr(
-        df,
-        ATR_LEN
-    )
-
-    # --------------------------------------------------------
-    # We want the pullback candles to be controlled.
-    # --------------------------------------------------------
-
-    sizes = []
-
-    for timestamp in recent.index:
-
-        try:
-
-            row_position = df.index.get_loc(
-                timestamp
-            )
-
-            candle = df.iloc[
-                row_position
-            ]
-
-            candle_atr = float(
-                atr_values.iloc[
-                    row_position
-                ]
-            )
-
-            if candle_atr <= 0:
-                continue
-
-            candle_range = (
-                float(candle["high"])
-                -
-                float(candle["low"])
-            )
-
-            candle_size = (
-                candle_range
-                /
-                candle_atr
-            )
-
-            sizes.append(
-                candle_size
-            )
-
-        except Exception:
-
-            continue
-
-    if not sizes:
-        return False
-
-    # A pullback made from enormous candles is not
-    # considered controlled.
-    controlled = (
-        max(sizes)
-        <=
-        MAX_PULLBACK_CANDLE_ATR
-    )
-
-    if not controlled:
-        return False
-
-    # --------------------------------------------------------
-    # Direction of the pullback.
-    # --------------------------------------------------------
-
-    if direction == "CRASH":
-
-        # Pullback is upward.
-        upward_count = 0
-
-        for timestamp in recent.index:
-
-            candle = recent.loc[
-                timestamp
-            ]
-
-            if (
-                candle["close"]
-                >
-                candle["open"]
-            ):
-
-                upward_count += 1
-
-        return (
-            upward_count >= 1
-        )
-
-    if direction == "BOOM":
-
-        # Pullback is downward.
-        downward_count = 0
-
-        for timestamp in recent.index:
-
-            candle = recent.loc[
-                timestamp
-            ]
-
-            if (
-                candle["close"]
-                <
-                candle["open"]
-            ):
-
-                downward_count += 1
-
-        return (
-            downward_count >= 1
-        )
-
-    return False
-
-
-# ============================================================
-# SPIKE → PULLBACK → WEAKENING → REVERSAL
-# ============================================================
-
-def detect_spike_pullback_reversal(
-    df,
-    direction
-):
-
-    result = {
-
-        "valid":
-            False,
-
-        "phase":
-            "WAITING",
-
-        "spike":
-            False,
-
-        "pullback":
-            False,
-
-        "weakening":
-            False,
-
-        "reversal":
-            False,
-
-        "spike_age":
-            None,
-
-        "spike_size_atr":
-            0.0,
-
-        "pullback_atr":
-            0.0,
-
-        "pullback_retrace":
-            0.0,
-
-        "reversal_size_atr":
-            0.0,
-
-        "spike_time":
-            None
-    }
-
-    spike = detect_recent_spike(
-        df,
-        direction
-    )
-
-    # ========================================================
-    # NO SPIKE
-    # ========================================================
-
-    if spike is None:
-
-        result["phase"] = (
-            "WAITING_FOR_SPIKE"
-        )
-
-        return result
-
-    age = (
-        len(df)
-        -
-        1
-        -
-        spike["index"]
-    )
-
-    # ========================================================
-    # SPIKE TOO OLD
-    # ========================================================
-
-    if age > MAX_SPIKE_AGE_BARS:
-
-        result["phase"] = (
-            "SPIKE_TOO_OLD"
-        )
-
-        return result
-
-    result["spike"] = True
-
-    result["spike_age"] = age
-
-    result["spike_size_atr"] = (
-        spike["size_atr"]
-    )
-
-    result["spike_time"] = (
-        spike["time"]
-    )
-
-    # --------------------------------------------------------
-    # Need candles after the spike.
-    # --------------------------------------------------------
-
-    after = df.iloc[
-        spike["index"] + 1:
-    ]
-
-    if len(after) < 2:
-
-        result["phase"] = (
-            "SPIKE_DETECTED"
-        )
-
-        return result
-
-    current = df.iloc[-1]
-    previous = df.iloc[-2]
-
-    atr_values = atr(
-        df,
-        ATR_LEN
-    )
-
-    current_atr = float(
-        atr_values.iloc[-1]
-    )
-
-    if current_atr <= 0:
-
-        result["phase"] = (
-            "NO_ATR"
-        )
-
-        return result
-
-    # ========================================================
-    # CRASH
-    # ========================================================
-
-    if direction == "CRASH":
-
-        spike_low = float(
-            spike["low"]
-        )
-
-        spike_high = float(
-            spike["high"]
-        )
-
-        # ----------------------------------------------------
-        # Highest price reached during pullback.
-        # ----------------------------------------------------
-
-        highest_pullback = float(
-            after["high"].max()
-        )
-
-        pullback_distance = (
-            highest_pullback
-            -
-            spike_low
-        )
-
-        pullback_atr = (
-            pullback_distance
-            /
-            current_atr
-        )
-
-        result["pullback_atr"] = (
-            float(pullback_atr)
-        )
-
-        # ----------------------------------------------------
-        # Calculate retracement of spike.
-        # ----------------------------------------------------
-
-        spike_range = (
-            spike_high
-            -
-            spike_low
-        )
-
-        if spike_range > 0:
-
-            retrace = (
-                highest_pullback
-                -
-                spike_low
-            ) / spike_range
-
-        else:
-
-            retrace = 0.0
-
-        result["pullback_retrace"] = (
-            float(retrace)
-        )
-
-        pullback = (
-            highest_pullback
-            >
-            spike["close"]
-            and
-            PULLBACK_MIN_ATR
-            <=
-            pullback_atr
-            <=
-            PULLBACK_MAX_ATR
-            and
-            retrace
-            <=
-            MAX_PULLBACK_RETRACE
-        )
-
-        if not pullback:
-
-            result["phase"] = (
-                "WAITING_FOR_PULLBACK"
-            )
-
-            return result
-
-        result["pullback"] = True
-
-        # ----------------------------------------------------
-        # Pullback must be controlled / weakening.
-        # ----------------------------------------------------
-
-        weakening = pullback_is_weakening(
-            df,
-            spike["index"],
-            direction
-        )
-
-        if not weakening:
-
-            result["phase"] = (
-                "PULLBACK_NOT_WEAKENING"
-            )
-
-            return result
-
-        result["weakening"] = True
-
-        # ----------------------------------------------------
-        # Controlled bearish reversal.
-        # ----------------------------------------------------
-
-        current_range = (
-            float(current["high"])
-            -
-            float(current["low"])
-        )
-
-        current_body = abs(
-            float(current["close"])
-            -
-            float(current["open"])
-        )
-
-        reversal_size_atr = (
-            max(
-                current_range,
-                current_body
-            )
-            /
-            current_atr
-        )
-
-        result["reversal_size_atr"] = (
-            float(reversal_size_atr)
-        )
-
-        bearish_candle = (
-            current["close"]
-            <
-            current["open"]
-        )
-
-        lower_close = (
-            current["close"]
-            <
-            previous["close"]
-        )
-
-        reversal = (
-            bearish_candle
-            and
-            lower_close
-            and
-            reversal_size_atr
-            <=
-            MAX_REVERSAL_ATR
-        )
-
-        if not reversal:
-
-            result["phase"] = (
-                "PULLBACK_WEAKENING_SELL"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # VALID SELL.
-        # ----------------------------------------------------
-
-        result["reversal"] = True
-
-        result["valid"] = True
-
-        result["phase"] = (
-            "SELL_READY"
-        )
-
-        return result
-
-    # ========================================================
-    # BOOM
-    # ========================================================
-
-    if direction == "BOOM":
-
-        spike_low = float(
-            spike["low"]
-        )
-
-        spike_high = float(
-            spike["high"]
-        )
-
-        # ----------------------------------------------------
-        # Lowest price reached during pullback.
-        # ----------------------------------------------------
-
-        lowest_pullback = float(
-            after["low"].min()
-        )
-
-        pullback_distance = (
-            spike_high
-            -
-            lowest_pullback
-        )
-
-        pullback_atr = (
-            pullback_distance
-            /
-            current_atr
-        )
-
-        result["pullback_atr"] = (
-            float(pullback_atr)
-        )
-
-        # ----------------------------------------------------
-        # Calculate retracement.
-        # ----------------------------------------------------
-
-        spike_range = (
-            spike_high
-            -
-            spike_low
-        )
-
-        if spike_range > 0:
-
-            retrace = (
-                spike_high
-                -
-                lowest_pullback
-            ) / spike_range
-
-        else:
-
-            retrace = 0.0
-
-        result["pullback_retrace"] = (
-            float(retrace)
-        )
-
-        pullback = (
-            lowest_pullback
-            <
-            spike["close"]
-            and
-            PULLBACK_MIN_ATR
-            <=
-            pullback_atr
-            <=
-            PULLBACK_MAX_ATR
-            and
-            retrace
-            <=
-            MAX_PULLBACK_RETRACE
-        )
-
-        if not pullback:
-
-            result["phase"] = (
-                "WAITING_FOR_PULLBACK"
-            )
-
-            return result
-
-        result["pullback"] = True
-
-        # ----------------------------------------------------
-        # Controlled / weakening pullback.
-        # ----------------------------------------------------
-
-        weakening = pullback_is_weakening(
-            df,
-            spike["index"],
-            direction
-        )
-
-        if not weakening:
-
-            result["phase"] = (
-                "PULLBACK_NOT_WEAKENING"
-            )
-
-            return result
-
-        result["weakening"] = True
-
-        # ----------------------------------------------------
-        # Controlled bullish reversal.
-        # ----------------------------------------------------
-
-        current_range = (
-            float(current["high"])
-            -
-            float(current["low"])
-        )
-
-        current_body = abs(
-            float(current["close"])
-            -
-            float(current["open"])
-        )
-
-        reversal_size_atr = (
-            max(
-                current_range,
-                current_body
-            )
-            /
-            current_atr
-        )
-
-        result["reversal_size_atr"] = (
-            float(reversal_size_atr)
-        )
-
-        bullish_candle = (
-            current["close"]
-            >
-            current["open"]
-        )
-
-        higher_close = (
-            current["close"]
-            >
-            previous["close"]
-        )
-
-        reversal = (
-            bullish_candle
-            and
-            higher_close
-            and
-            reversal_size_atr
-            <=
-            MAX_REVERSAL_ATR
-        )
-
-        if not reversal:
-
-            result["phase"] = (
-                "PULLBACK_WEAKENING_BUY"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # VALID BUY.
-        # ----------------------------------------------------
-
-        result["reversal"] = True
-
-        result["valid"] = True
-
-        result["phase"] = (
-            "BUY_READY"
-        )
-
-        return result
-
-    return result
+    return trigger, current_rsi
 
 
 # ============================================================
@@ -1793,769 +1509,464 @@ def detect_spike_pullback_reversal(
 # ============================================================
 
 def higher_timeframe_alignment(
-    synthetic_type,
-    snaps
+    snapshots,
+    direction
 ):
+    wanted = direction_label(
+        direction
+    )
 
-    h12 = snaps["12H"]
-    h4 = snaps["4H"]
-    h1 = snaps["1H"]
-    m15 = snaps["15M"]
-    m5 = snaps["5M"]
+    h12 = snapshots.get("12H")
 
-    # ========================================================
-    # CRASH SELL
-    # ========================================================
-
-    if synthetic_type == "CRASH":
-
-        h12_bearish = (
-            h12["ema_trend"] == "BEARISH"
-            and
-            h12["supertrend"] == "BEARISH"
-        )
-
-        h4_bearish = (
-            h4["ema_trend"] == "BEARISH"
-            and
-            h4["supertrend"] == "BEARISH"
-        )
-
-        h1_bearish = (
-            h1["ema_trend"] == "BEARISH"
-            and
-            h1["supertrend"] == "BEARISH"
-        )
-
-        m15_bearish = (
-            m15["ema_trend"] == "BEARISH"
-            and
-            m15["supertrend"] == "BEARISH"
-        )
-
-        m5_bearish = (
-            m5["ema_trend"] == "BEARISH"
-            or
-            m5["supertrend"] == "BEARISH"
-            or
-            m5["rsi"] <= 48
-        )
-
+    if not h12:
         return {
-
-            "h12":
-                h12_bearish,
-
-            "h4":
-                h4_bearish,
-
-            "h1":
-                h1_bearish,
-
-            "m15":
-                m15_bearish,
-
-            "m5":
-                m5_bearish,
-
-            "all_higher":
-                (
-                    h12_bearish
-                    and
-                    h4_bearish
-                    and
-                    h1_bearish
-                    and
-                    m15_bearish
-                ),
-
-            "all_confirmed":
-                (
-                    h12_bearish
-                    and
-                    h4_bearish
-                    and
-                    h1_bearish
-                    and
-                    m15_bearish
-                    and
-                    m5_bearish
-                )
+            "h12_ok": False,
+            "h12_direction": "NEUTRAL",
+            "lower_agreement": 0,
+            "lower_total": 3,
+            "all_higher": False,
+            "directions": {},
         }
 
-    # ========================================================
-    # BOOM BUY
-    # ========================================================
+    h12_direction = h12["direction"]
 
-    if synthetic_type == "BOOM":
+    h12_ok = (
+        h12_direction == wanted
+    )
 
-        h12_bullish = (
-            h12["ema_trend"] == "BULLISH"
-            and
-            h12["supertrend"] == "BULLISH"
-        )
+    lower_names = [
+        "4H",
+        "1H",
+        "15M",
+    ]
 
-        h4_bullish = (
-            h4["ema_trend"] == "BULLISH"
-            and
-            h4["supertrend"] == "BULLISH"
-        )
+    directions = {}
 
-        h1_bullish = (
-            h1["ema_trend"] == "BULLISH"
-            and
-            h1["supertrend"] == "BULLISH"
-        )
+    agreement = 0
 
-        m15_bullish = (
-            m15["ema_trend"] == "BULLISH"
-            and
-            m15["supertrend"] == "BULLISH"
-        )
+    for name in lower_names:
 
-        m5_bullish = (
-            m5["ema_trend"] == "BULLISH"
-            or
-            m5["supertrend"] == "BULLISH"
-            or
-            m5["rsi"] >= 52
-        )
+        snap = snapshots.get(name)
 
-        return {
+        if not snap:
+            directions[name] = "NEUTRAL"
+            continue
 
-            "h12":
-                h12_bullish,
+        d = tf_direction(snap)
 
-            "h4":
-                h4_bullish,
+        directions[name] = d
 
-            "h1":
-                h1_bullish,
+        if d == wanted:
+            agreement += 1
 
-            "m15":
-                m15_bullish,
-
-            "m5":
-                m5_bullish,
-
-            "all_higher":
-                (
-                    h12_bullish
-                    and
-                    h4_bullish
-                    and
-                    h1_bullish
-                    and
-                    m15_bullish
-                ),
-
-            "all_confirmed":
-                (
-                    h12_bullish
-                    and
-                    h4_bullish
-                    and
-                    h1_bullish
-                    and
-                    m15_bullish
-                    and
-                    m5_bullish
-                )
-        }
+    lower_ok = (
+        agreement >= LOWER_TF_REQUIRED
+    )
 
     return {
-
-        "h12": False,
-        "h4": False,
-        "h1": False,
-        "m15": False,
-        "m5": False,
-        "all_higher": False,
-        "all_confirmed": False
+        "h12_ok": h12_ok,
+        "h12_direction": h12_direction,
+        "h12_bull_score": h12.get(
+            "bullish_score",
+            0
+        ),
+        "h12_bear_score": h12.get(
+            "bearish_score",
+            0
+        ),
+        "lower_agreement": agreement,
+        "lower_total": len(lower_names),
+        "lower_ok": lower_ok,
+        "all_higher": (
+            h12_ok and lower_ok
+        ),
+        "directions": directions,
     }
 
 
 # ============================================================
-# SCORE
+# TECHNICAL SCORE
 # ============================================================
 
-def score_synthetic_setup(
-    name,
-    snaps,
+def calculate_score(
     structure,
-    alignment
+    alignment,
+    five_trigger,
 ):
-
-    synthetic_type = synthetic_direction(
-        name
-    )
-
-    if synthetic_type == "CRASH":
-
-        direction = "SELL"
-
-    elif synthetic_type == "BOOM":
-
-        direction = "BUY"
-
-    else:
-
-        return 0, None
-
     score = 0
 
-    # --------------------------------------------------------
-    # STRUCTURE
-    # --------------------------------------------------------
-
-    if structure["spike"]:
+    # Spike
+    if structure.get(
+        "spike_size_atr",
+        0
+    ) >= SPIKE_MIN_ATR:
         score += 2
 
-    if structure["pullback"]:
+    # Pullback
+    pullback = structure.get(
+        "pullback_atr",
+        0
+    )
+
+    if (
+        PULLBACK_MIN_ATR
+        <= pullback
+        <= PULLBACK_MAX_ATR
+    ):
         score += 2
 
-    if structure["weakening"]:
-        score += 1
+    # Reversal
+    phase = structure.get(
+        "phase",
+        ""
+    )
 
-    if structure["reversal"]:
+    if phase == "PULLBACK_WEAKENING":
         score += 2
 
-    # --------------------------------------------------------
-    # HTF
-    # --------------------------------------------------------
+    elif phase == "CONTROLLED_REVERSAL":
+        score += 2
 
-    if alignment["h12"]:
+    # H12
+    if alignment.get(
+        "h12_ok",
+        False
+    ):
+        score += 2
+
+    # Lower timeframe
+    if alignment.get(
+        "lower_ok",
+        False
+    ):
         score += 1
 
-    if alignment["h4"]:
+    # 5M
+    if five_trigger:
         score += 1
 
-    if alignment["h1"]:
-        score += 1
-
-    if alignment["m15"]:
-        score += 1
-
-    # --------------------------------------------------------
-    # Maximum theoretical score = 11.
-    # We keep SIGNAL_MIN at 8.
-    # --------------------------------------------------------
-
-    return score, direction
+    return min(
+        score,
+        10
+    )
 
 
 # ============================================================
-# GROQ REVIEW
+# GROQ ADVISORY
 # ============================================================
 
 def groq_review(
-    name,
-    snaps,
+    target,
+    direction,
     score,
     structure,
-    alignment
+    alignment,
+    five_trigger,
 ):
+    """
+    Groq is ADVISORY ONLY.
+
+    It cannot reverse:
+      CRASH SELL
+      BOOM BUY
+
+    It can provide an opinion/note.
+    """
 
     if not GROQ_API_KEY:
-
         return {
-
-            "decision":
-                "PASS",
-
-            "confidence":
-                0,
-
-            "reason":
-                "Groq API key missing"
+            "decision": "NO_AI",
+            "confidence": 0,
+            "note": "Groq not configured",
         }
 
-    if Groq is None:
-
-        return {
-
-            "decision":
-                "PASS",
-
-            "confidence":
-                0,
-
-            "reason":
-                "Groq package missing"
-        }
-
-    synthetic_type = synthetic_direction(
-        name
-    )
-
-    if synthetic_type == "CRASH":
-
-        expected = "SELL"
-
-        allowed = "SELL ONLY"
-
-    else:
-
-        expected = "BUY"
-
-        allowed = "BUY ONLY"
-
-    data = {
-
-        "12H": {
-            "ema":
-                snaps["12H"]["ema_trend"],
-            "supertrend":
-                snaps["12H"]["supertrend"]
-        },
-
-        "4H": {
-            "ema":
-                snaps["4H"]["ema_trend"],
-            "supertrend":
-                snaps["4H"]["supertrend"]
-        },
-
-        "1H": {
-            "ema":
-                snaps["1H"]["ema_trend"],
-            "supertrend":
-                snaps["1H"]["supertrend"]
-        },
-
-        "15M": {
-            "ema":
-                snaps["15M"]["ema_trend"],
-            "supertrend":
-                snaps["15M"]["supertrend"]
-        },
-
-        "5M": {
-            "ema":
-                snaps["5M"]["ema_trend"],
-            "supertrend":
-                snaps["5M"]["supertrend"],
-            "rsi":
-                round(
-                    snaps["5M"]["rsi"],
-                    1
-                )
-        },
-
-        "spike":
-            structure["spike"],
-
-        "pullback":
-            structure["pullback"],
-
-        "weakening":
-            structure["weakening"],
-
-        "reversal":
-            structure["reversal"],
-
-        "spike_age":
-            structure["spike_age"],
-
-        "spike_size_atr":
-            round(
-                structure["spike_size_atr"],
-                2
-            ),
-
-        "pullback_atr":
-            round(
-                structure["pullback_atr"],
-                2
-            ),
-
-        "pullback_retrace":
-            round(
-                structure["pullback_retrace"],
-                2
-            ),
-
-        "reversal_size_atr":
-            round(
-                structure["reversal_size_atr"],
-                2
-            )
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are reviewing a Deriv Crash/Boom "
+                    "pullback scanner. You are advisory only. "
+                    "Do not invent market data. "
+                    "CRASH setups can only be SELL. "
+                    "BOOM setups can only be BUY. "
+                    "Evaluate whether the technical setup is "
+                    "coherent. Return JSON only with keys: "
+                    "decision, confidence, note. "
+                    "decision must be BUY, SELL, WATCH, or PASS."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({
+                    "symbol": target,
+                    "technical_direction": direction,
+                    "technical_score": score,
+                    "phase": structure.get(
+                        "phase"
+                    ),
+                    "spike_size_atr": structure.get(
+                        "spike_size_atr"
+                    ),
+                    "pullback_atr": structure.get(
+                        "pullback_atr"
+                    ),
+                    "trigger_size_atr": structure.get(
+                        "trigger_size_atr"
+                    ),
+                    "h12": alignment.get(
+                        "h12_direction"
+                    ),
+                    "lower_timeframes": alignment.get(
+                        "directions"
+                    ),
+                    "lower_agreement": alignment.get(
+                        "lower_agreement"
+                    ),
+                    "five_minute_trigger": five_trigger,
+                }),
+            },
+        ],
+        "temperature": 0.1,
+        "max_completion_tokens": 300,
     }
 
-    prompt = f"""
-You are the final quality-control layer for a
-synthetic-index pullback scanner.
-
-This scanner DOES NOT automatically trade.
-
-Instrument:
-{name}
-
-Synthetic type:
-{synthetic_type}
-
-Allowed direction:
-{allowed}
-
-Expected direction:
-{expected}
-
-The ONLY valid pattern is:
-
-CRASH:
-DOWN SPIKE
--> UPWARD PULLBACK
--> PULLBACK WEAKENS
--> CONTROLLED BEARISH REVERSAL
--> SELL
-
-BOOM:
-UP SPIKE
--> DOWNWARD PULLBACK
--> PULLBACK WEAKENS
--> CONTROLLED BULLISH REVERSAL
--> BUY
-
-HARD RULES:
-
-1. 12H MUST agree with the expected direction.
-
-2. 4H MUST agree.
-
-3. 1H MUST agree.
-
-4. 15M MUST agree.
-
-5. CRASH can NEVER produce BUY.
-
-6. BOOM can NEVER produce SELL.
-
-7. A huge continuation candle must NOT be approved
-   as a controlled reversal.
-
-8. Reversal larger than 1.25 ATR must be rejected.
-
-9. If the 12H disagrees, PASS.
-
-10. Do not override the scanner's structure.
-
-Technical score:
-{score}
-
-Structure:
-{json.dumps(data)}
-
-Return ONLY JSON:
-
-{{
-  "decision": "BUY|SELL|WATCH|PASS",
-  "confidence": 0,
-  "reason": "short explanation"
-}}
-"""
-
     try:
-
-        client = Groq(
-            api_key=GROQ_API_KEY
+        response = HTTP.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization":
+                    f"Bearer {GROQ_API_KEY}",
+                "Content-Type":
+                    "application/json",
+            },
+            json=payload,
+            timeout=15,
         )
 
-        response = (
-            client
-            .chat
-            .completions
-            .create(
-                model=GROQ_MODEL,
+        response.raise_for_status()
 
-                messages=[
-                    {
-                        "role": "system",
-                        "content":
-                            "Return valid JSON only."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
+        data = response.json()
 
-                temperature=0.1,
-
-                max_completion_tokens=512,
-
-                reasoning_effort="low",
-
-                response_format={
-                    "type": "json_object"
-                }
-            )
-        )
-
-        text = (
-            response
-            .choices[0]
-            .message
-            .content
+        content = (
+            data["choices"][0]
+            ["message"]["content"]
             .strip()
         )
 
-        if text.startswith("```"):
-
-            text = (
-                text
-                .replace(
-                    "```json",
-                    ""
-                )
-                .replace(
-                    "```",
-                    ""
-                )
-                .strip()
-            )
-
-        result = json.loads(
-            text
-        )
-
-        decision = str(
-            result.get(
-                "decision",
-                "PASS"
-            )
-        ).upper().strip()
-
-        if decision not in (
-            "BUY",
-            "SELL",
-            "WATCH",
-            "PASS"
-        ):
-
-            decision = "PASS"
-
-        confidence = result.get(
-            "confidence",
-            0
-        )
-
-        try:
-
-            confidence = float(
-                confidence
-            )
-
-        except Exception:
-
-            confidence = 0
-
-        confidence = max(
-            0,
-            min(
-                100,
-                confidence
-            )
-        )
-
-        reason = str(
-            result.get(
-                "reason",
-                ""
-            )
+        # Strip markdown code fences if model uses them.
+        content = content.replace(
+            "```json",
+            ""
+        ).replace(
+            "```",
+            ""
         ).strip()
 
-        # ====================================================
-        # HARD PYTHON PROTECTION
-        # ====================================================
-
-        # CRASH can ONLY SELL.
-        if (
-            synthetic_type == "CRASH"
-            and
-            decision == "BUY"
-        ):
-
-            decision = "PASS"
-
-            reason = (
-                "CRASH BUY blocked by hard direction rule."
-            )
-
-        # BOOM can ONLY BUY.
-        if (
-            synthetic_type == "BOOM"
-            and
-            decision == "SELL"
-        ):
-
-            decision = "PASS"
-
-            reason = (
-                "BOOM SELL blocked by hard direction rule."
-            )
-
-        # 12H / 4H / 1H / 15M must all agree.
-        if not alignment["all_higher"]:
-
-            decision = "PASS"
-
-            reason = (
-                "Higher timeframes are not fully aligned."
-            )
-
-        # Structure must be fully valid.
-        if not structure["valid"]:
-
-            decision = "PASS"
-
-            reason = (
-                "Spike, pullback, weakening and "
-                "controlled reversal are not all confirmed."
-            )
-
-        # Huge reversal protection.
-        if (
-            structure["reversal_size_atr"]
-            >
-            MAX_REVERSAL_ATR
-        ):
-
-            decision = "PASS"
-
-            reason = (
-                "Reversal candle is too large."
-            )
-
-        # Direction must match expected direction.
-        if (
-            decision in ("BUY", "SELL")
-            and
-            decision != expected
-        ):
-
-            decision = "PASS"
-
-            reason = (
-                "Direction does not match synthetic type."
-            )
+        result = json.loads(content)
 
         return {
+            "decision": str(
+                result.get(
+                    "decision",
+                    "WATCH"
+                )
+            ).upper(),
 
-            "decision":
-                decision,
+            "confidence": int(
+                safe_float(
+                    result.get(
+                        "confidence",
+                        0
+                    )
+                )
+            ),
 
-            "confidence":
-                confidence,
-
-            "reason":
-                reason
+            "note": str(
+                result.get(
+                    "note",
+                    ""
+                )
+            )[:500],
         }
 
     except Exception as e:
-
-        log.error(
-            "%s GROQ ERROR: %s",
-            name,
+        print(
+            f"{target} GROQ ERROR:",
             e
         )
 
         return {
-
-            "decision":
-                "PASS",
-
-            "confidence":
-                0,
-
-            "reason":
-                "Groq review failed"
+            "decision": "AI_ERROR",
+            "confidence": 0,
+            "note": "AI review unavailable",
         }
 
 
 # ============================================================
-# SIGNAL MESSAGE
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM ERROR: missing TELEGRAM_BOT_TOKEN")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("TELEGRAM ERROR: missing TELEGRAM_CHAT_ID")
+        return False
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    try:
+        response = HTTP.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+            },
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        return True
+
+    except Exception as e:
+        print(
+            "TELEGRAM SEND ERROR:",
+            e
+        )
+
+        return False
+
+
+# ============================================================
+# FORMAT MESSAGE
 # ============================================================
 
 def build_signal_message(
-    name,
-    symbol,
+    target,
     direction,
     score,
-    groq_result,
-    snaps,
-    structure
+    structure,
+    alignment,
+    five_rsi,
+    groq,
 ):
+    if target.startswith("CRASH"):
+        emoji = "🔴"
+        action = "SELL"
+    else:
+        emoji = "🟢"
+        action = "BUY"
 
-    emoji = (
-        "🔴"
-        if direction == "SELL"
-        else
-        "🟢"
+    phase = structure.get(
+        "phase",
+        "UNKNOWN"
     )
 
-    return (
-        f"{emoji} {name} — "
-        f"{direction} PULLBACK SIGNAL\n\n"
-
-        f"Technical score: "
-        f"{score}/11\n"
-
-        f"Symbol: {symbol}\n"
-
-        f"Price: "
-        f"{snaps['5M']['close']}\n\n"
-
-        f"SETUP:\n"
-        f"Spike → Pullback → "
-        f"Weakening → Reversal\n\n"
-
-        f"Phase: "
-        f"{structure['phase']}\n"
-
-        f"Spike age: "
-        f"{structure['spike_age']} candles\n"
-
-        f"Spike size: "
-        f"{structure['spike_size_atr']:.2f} ATR\n"
-
-        f"Pullback: "
-        f"{structure['pullback_atr']:.2f} ATR\n"
-
-        f"Retracement: "
-        f"{structure['pullback_retrace'] * 100:.0f}%\n"
-
-        f"Reversal: "
-        f"{structure['reversal_size_atr']:.2f} ATR\n\n"
-
-        f"MULTI-TIMEFRAME:\n"
-
-        f"12H: "
-        f"{snaps['12H']['ema_trend']}\n"
-
-        f"4H: "
-        f"{snaps['4H']['ema_trend']}\n"
-
-        f"1H: "
-        f"{snaps['1H']['ema_trend']}\n"
-
-        f"15M: "
-        f"{snaps['15M']['ema_trend']}\n"
-
-        f"5M: "
-        f"{snaps['5M']['supertrend']}\n"
-
-        f"5M RSI: "
-        f"{snaps['5M']['rsi']:.1f}\n\n"
-
-        f"Groq confidence: "
-        f"{groq_result['confidence']:.0f}%\n"
-
-        f"AI note: "
-        f"{groq_result['reason']}\n\n"
-
-        f"Scanner only — "
-        f"no automatic trading."
+    spike_age = structure.get(
+        "age",
+        0
     )
+
+    spike_size = structure.get(
+        "spike_size_atr",
+        0
+    )
+
+    pullback = structure.get(
+        "pullback_atr",
+        0
+    )
+
+    trigger_size = structure.get(
+        "trigger_size_atr",
+        0
+    )
+
+    lower = alignment.get(
+        "directions",
+        {}
+    )
+
+    h12 = alignment.get(
+        "h12_direction",
+        "NEUTRAL"
+    )
+
+    lower_agreement = alignment.get(
+        "lower_agreement",
+        0
+    )
+
+    lower_total = alignment.get(
+        "lower_total",
+        3
+    )
+
+    ai_decision = groq.get(
+        "decision",
+        "NO_AI"
+    )
+
+    ai_confidence = groq.get(
+        "confidence",
+        0
+    )
+
+    ai_note = groq.get(
+        "note",
+        ""
+    )
+
+    lines = [
+        f"{emoji} {target} — {action} PULLBACK SIGNAL",
+        "",
+        f"Technical score: {score}/10",
+        f"Symbol: {target}",
+        "",
+        "SETUP:",
+        "Spike → Pullback → Weakening/Reversal",
+        "",
+        f"Phase: {phase}",
+        f"Spike age: {spike_age} candles",
+        f"Spike size: {spike_size:.2f} ATR",
+        f"Pullback: {pullback:.2f} ATR",
+        f"Trigger candle: {trigger_size:.2f} ATR",
+        "",
+        "MULTI-TIMEFRAME:",
+        f"12H: {h12}",
+        f"4H: {lower.get('4H', 'NEUTRAL')}",
+        f"1H: {lower.get('1H', 'NEUTRAL')}",
+        f"15M: {lower.get('15M', 'NEUTRAL')}",
+        f"5M: {direction_label(direction)}",
+        f"5M RSI: {five_rsi:.1f}",
+        "",
+        f"HTF agreement: "
+        f"{lower_agreement}/{lower_total}",
+        "",
+        f"Groq advisory: "
+        f"{ai_decision} "
+        f"({ai_confidence}%)",
+    ]
+
+    if ai_note:
+        lines.extend([
+            f"AI note: {ai_note}",
+        ])
+
+    lines.extend([
+        "",
+        "Scanner only — no automatic trade."
+    ])
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -2563,914 +1974,825 @@ def build_signal_message(
 # ============================================================
 
 def build_watch_message(
-    name,
-    symbol,
+    target,
     direction,
-    score,
-    groq_result,
-    snaps,
-    structure
+    structure,
+    alignment,
+    five_trigger,
 ):
+    if target.startswith("CRASH"):
+        emoji = "👀"
+        action = "SELL"
+    else:
+        emoji = "👀"
+        action = "BUY"
 
-    return (
-        f"👀 {name} — WATCH\n\n"
-
-        f"Potential direction: "
-        f"{direction}\n"
-
-        f"Technical score: "
-        f"{score}/11\n"
-
-        f"Symbol: {symbol}\n"
-
-        f"Price: "
-        f"{snaps['5M']['close']}\n\n"
-
-        f"PHASE:\n"
-        f"{structure['phase']}\n\n"
-
-        f"Spike: "
-        f"{'YES' if structure['spike'] else 'NO'}\n"
-
-        f"Pullback: "
-        f"{'YES' if structure['pullback'] else 'NO'}\n"
-
-        f"Weakening: "
-        f"{'YES' if structure['weakening'] else 'NO'}\n"
-
-        f"Reversal: "
-        f"{'YES' if structure['reversal'] else 'NO'}\n\n"
-
-        f"12H: "
-        f"{snaps['12H']['ema_trend']}\n"
-
-        f"4H: "
-        f"{snaps['4H']['ema_trend']}\n"
-
-        f"1H: "
-        f"{snaps['1H']['ema_trend']}\n"
-
-        f"15M: "
-        f"{snaps['15M']['ema_trend']}\n"
-
-        f"5M: "
-        f"{snaps['5M']['supertrend']}\n\n"
-
-        f"Groq confidence: "
-        f"{groq_result['confidence']:.0f}%\n"
-
-        f"AI note: "
-        f"{groq_result['reason']}\n\n"
-
-        f"Not a confirmed signal."
+    lower = alignment.get(
+        "directions",
+        {}
     )
+
+    return "\n".join([
+        f"{emoji} {target} — WATCH {action}",
+        "",
+        f"Phase: {structure.get('phase')}",
+        f"Spike age: {structure.get('age', 0)} candles",
+        (
+            f"Spike: "
+            f"{structure.get('spike_size_atr', 0):.2f} ATR"
+        ),
+        (
+            f"Pullback: "
+            f"{structure.get('pullback_atr', 0):.2f} ATR"
+        ),
+        "",
+        f"12H: "
+        f"{alignment.get('h12_direction', 'NEUTRAL')}",
+        f"4H: {lower.get('4H', 'NEUTRAL')}",
+        f"1H: {lower.get('1H', 'NEUTRAL')}",
+        f"15M: {lower.get('15M', 'NEUTRAL')}",
+        "",
+        f"5M trigger: "
+        f"{'YES' if five_trigger else 'NO'}",
+    ])
 
 
 # ============================================================
-# SCAN ONE
+# DUPLICATE CONTROL
+# ============================================================
+
+def was_sent(target, candle_time):
+    return STATE["sent"].get(
+        target
+    ) == candle_time
+
+
+def mark_sent(target, candle_time):
+    STATE["sent"][target] = candle_time
+
+    # Keep state from growing forever.
+    if len(STATE["sent"]) > 100:
+        items = list(
+            STATE["sent"].items()
+        )
+
+        STATE["sent"] = dict(
+            items[-50:]
+        )
+
+
+# ============================================================
+# ONE TARGET SCAN
 # ============================================================
 
 def scan_one(
-    name,
-    symbol,
-    state
+    target,
+    symbol
 ):
-
-    log.info(
-        "Scanning %s (%s)",
-        name,
-        symbol
+    print("")
+    print(
+        f"========== {target} =========="
+    )
+    print(
+        f"{target} symbol={symbol}"
     )
 
-    synthetic_type = synthetic_direction(
-        name
+    is_crash = target.startswith(
+        "CRASH"
     )
 
-    # ========================================================
-    # FETCH DATA
-    # ========================================================
-
-    df_4h = get_candles(
-        symbol,
-        TIMEFRAMES["4H"],
-        300
-    )
-
-    df_12h = build_12h_from_4h(
-        df_4h
-    )
-
-    df_1h = get_candles(
-        symbol,
-        TIMEFRAMES["1H"],
-        250
-    )
-
-    df_15m = get_candles(
-        symbol,
-        TIMEFRAMES["15M"],
-        250
-    )
-
-    df_5m = get_candles(
-        symbol,
-        TIMEFRAMES["5M"],
-        250
-    )
-
-    # ========================================================
-    # SNAPSHOTS
-    # ========================================================
-
-    snaps = {
-
-        "12H":
-            indicator_snapshot(
-                df_12h
-            ),
-
-        "4H":
-            indicator_snapshot(
-                df_4h
-            ),
-
-        "1H":
-            indicator_snapshot(
-                df_1h
-            ),
-
-        "15M":
-            indicator_snapshot(
-                df_15m
-            ),
-
-        "5M":
-            indicator_snapshot(
-                df_5m
-            )
-    }
-
-    # ========================================================
-    # STRUCTURE
-    # ========================================================
-
-    structure = (
-        detect_spike_pullback_reversal(
-            df_5m,
-            synthetic_type
-        )
-    )
-
-    log.info(
-        (
-            "%s STRUCTURE "
-            "phase=%s "
-            "spike=%s "
-            "pullback=%s "
-            "weakening=%s "
-            "reversal=%s "
-            "age=%s "
-            "spike=%.2f ATR "
-            "pullback=%.2f ATR "
-            "retrace=%.0f%% "
-            "reversal=%.2f ATR"
-        ),
-
-        name,
-
-        structure["phase"],
-
-        structure["spike"],
-
-        structure["pullback"],
-
-        structure["weakening"],
-
-        structure["reversal"],
-
-        structure["spike_age"],
-
-        structure["spike_size_atr"],
-
-        structure["pullback_atr"],
-
-        structure["pullback_retrace"] * 100,
-
-        structure["reversal_size_atr"]
-    )
-
-    # ========================================================
-    # HTF ALIGNMENT
-    # ========================================================
-
-    alignment = higher_timeframe_alignment(
-        synthetic_type,
-        snaps
-    )
-
-    log.info(
-        (
-            "%s ALIGNMENT "
-            "12H=%s "
-            "4H=%s "
-            "1H=%s "
-            "15M=%s "
-            "5M=%s "
-            "ALL_HTF=%s"
-        ),
-
-        name,
-
-        alignment["h12"],
-
-        alignment["h4"],
-
-        alignment["h1"],
-
-        alignment["m15"],
-
-        alignment["m5"],
-
-        alignment["all_higher"]
-    )
-
-    # ========================================================
-    # CRITICAL 12H PROTECTION
-    # ========================================================
-
-    if not alignment["h12"]:
-
-        log.info(
-            (
-                "%s BLOCKED - "
-                "12H does not agree with %s"
-            ),
-
-            name,
-
-            (
-                "SELL"
-                if synthetic_type == "CRASH"
-                else
-                "BUY"
-            )
-        )
-
-        return
-
-    # ========================================================
-    # WAITING FOR SPIKE
-    # ========================================================
-
-    if not structure["spike"]:
-
-        log.info(
-            "%s WAITING FOR %s SPIKE",
-            name,
-            synthetic_type
-        )
-
-        return
-
-    # ========================================================
-    # WAITING FOR PULLBACK
-    # ========================================================
-
-    if not structure["pullback"]:
-
-        log.info(
-            "%s SPIKE DETECTED - WAITING FOR PULLBACK",
-            name
-        )
-
-        return
-
-    # ========================================================
-    # WAITING FOR WEAKENING
-    # ========================================================
-
-    if not structure["weakening"]:
-
-        log.info(
-            "%s PULLBACK DETECTED - WAITING FOR WEAKENING",
-            name
-        )
-
-        return
-
-    # ========================================================
-    # WAITING FOR REVERSAL
-    # ========================================================
-
-    if not structure["reversal"]:
-
-        log.info(
-            (
-                "%s PULLBACK WEAKENING - "
-                "WAITING FOR CONTROLLED REVERSAL"
-            ),
-            name
-        )
-
-        return
-
-    # ========================================================
-    # ALL HIGHER TIMEFRAMES
-    # ========================================================
-
-    if not alignment["all_higher"]:
-
-        log.info(
-            (
-                "%s BLOCKED - "
-                "4H/1H/15M not aligned with 12H"
-            ),
-            name
-        )
-
-        return
-
-    # ========================================================
-    # EXTRA HARD REVERSAL PROTECTION
-    # ========================================================
-
-    if (
-        structure["reversal_size_atr"]
-        >
-        MAX_REVERSAL_ATR
-    ):
-
-        log.info(
-            (
-                "%s BLOCKED - "
-                "reversal %.2f ATR > max %.2f ATR"
-            ),
-
-            name,
-
-            structure["reversal_size_atr"],
-
-            MAX_REVERSAL_ATR
-        )
-
-        return
-
-    # ========================================================
-    # SCORE
-    # ========================================================
-
-    score, proposal = (
-        score_synthetic_setup(
-            name,
-            snaps,
-            structure,
-            alignment
-        )
-    )
-
-    log.info(
-        "%s VALID STRUCTURE score=%d direction=%s",
-        name,
-        score,
-        proposal
-    )
-
-    if score < SIGNAL_MIN:
-
-        log.info(
-            (
-                "%s score=%d below "
-                "signal threshold=%d"
-            ),
-
-            name,
-
-            score,
-
-            SIGNAL_MIN
-        )
-
-        return
-
-    # ========================================================
-    # GROQ REVIEW
-    # ========================================================
-
-    groq_result = groq_review(
-        name,
-        snaps,
-        score,
-        structure,
-        alignment
-    )
-
-    ai_decision = str(
-        groq_result.get(
-            "decision",
-            "PASS"
-        )
-    ).upper()
-
-    log.info(
-        (
-            "%s GROQ=%s "
-            "confidence=%.0f%% "
-            "reason=%s"
-        ),
-
-        name,
-
-        ai_decision,
-
-        groq_result.get(
-            "confidence",
-            0
-        ),
-
-        groq_result.get(
-            "reason",
-            ""
-        )
-    )
-
-    # ========================================================
-    # FINAL HARD DIRECTION
-    # ========================================================
-
-    if synthetic_type == "CRASH":
-
-        if proposal != "SELL":
-
-            log.warning(
-                "%s invalid CRASH direction",
-                name
-            )
-
-            return
-
-        if ai_decision == "BUY":
-
-            log.warning(
-                "%s BLOCKED CRASH BUY",
-                name
-            )
-
-            return
-
-    elif synthetic_type == "BOOM":
-
-        if proposal != "BUY":
-
-            log.warning(
-                "%s invalid BOOM direction",
-                name
-            )
-
-            return
-
-        if ai_decision == "SELL":
-
-            log.warning(
-                "%s BLOCKED BOOM SELL",
-                name
-            )
-
-            return
-
-    # ========================================================
-    # AI MUST NOT OVERRIDE STRUCTURE
-    # ========================================================
-
-    if not structure["valid"]:
-
-        log.warning(
-            "%s blocked - structure not valid",
-            name
-        )
-
-        return
-
-    if not alignment["all_higher"]:
-
-        log.warning(
-            "%s blocked - HTF not aligned",
-            name
-        )
-
-        return
-
-    # ========================================================
-    # DUPLICATE CONTROL
-    # ========================================================
-
-    candle_key = (
-        snaps["5M"]["candle_time"]
-    )
-
-    state_key = (
-        f"{name}:{ai_decision}"
-    )
-
-    if (
-        state.get(state_key)
-        ==
-        candle_key
-    ):
-
-        log.info(
-            "%s duplicate %s ignored",
-            name,
-            ai_decision
-        )
-
-        return
-
-    # ========================================================
-    # FINAL SIGNAL
-    # ========================================================
-
-    if ai_decision in (
-        "BUY",
+    direction = (
         "SELL"
-    ):
-
-        if ai_decision != proposal:
-
-            log.warning(
-                (
-                    "%s AI direction=%s "
-                    "doesn't match proposal=%s"
-                ),
-
-                name,
-
-                ai_decision,
-
-                proposal
-            )
-
-            return
-
-        message = build_signal_message(
-            name,
-            symbol,
-            ai_decision,
-            score,
-            groq_result,
-            snaps,
-            structure
-        )
-
-        try:
-
-            send_telegram(
-                message
-            )
-
-            state[state_key] = (
-                candle_key
-            )
-
-            log.info(
-                "%s %s SIGNAL SENT",
-                name,
-                ai_decision
-            )
-
-        except Exception as e:
-
-            log.error(
-                "%s TELEGRAM ERROR: %s",
-                name,
-                e
-            )
-
-        return
-
-    # ========================================================
-    # WATCH
-    # ========================================================
-
-    if ai_decision == "WATCH":
-
-        message = build_watch_message(
-            name,
-            symbol,
-            proposal,
-            score,
-            groq_result,
-            snaps,
-            structure
-        )
-
-        try:
-
-            send_telegram(
-                message
-            )
-
-            state[state_key] = (
-                candle_key
-            )
-
-            log.info(
-                "%s WATCH SENT",
-                name
-            )
-
-        except Exception as e:
-
-            log.error(
-                "%s TELEGRAM ERROR: %s",
-                name,
-                e
-            )
-
-        return
-
-    # ========================================================
-    # PASS
-    # ========================================================
-
-    log.info(
-        "%s PASS - no signal",
-        name
+        if is_crash
+        else
+        "BUY"
     )
 
+    # --------------------------------------------------------
+    # FETCH TIMEFRAMES
+    # --------------------------------------------------------
 
-# ============================================================
-# RUN SCAN
-# ============================================================
-
-def run_scan():
-
-    log.info(
-        "======================================"
-    )
-
-    log.info(
-        "STARTING SCAN CYCLE"
-    )
-
-    log.info(
-        "Pattern: SPIKE -> PULLBACK -> WEAKENING -> REVERSAL"
-    )
-
-    log.info(
-        "CRASH = SELL ONLY"
-    )
-
-    log.info(
-        "BOOM = BUY ONLY"
-    )
-
-    log.info(
-        "12H = HARD DIRECTION FILTER"
-    )
-
-    log.info(
-        "4H + 1H + 15M = MUST AGREE"
-    )
-
-    log.info(
-        "5M = ENTRY TRIGGER"
-    )
-
-    log.info(
-        "Max reversal = %.2f ATR",
-        MAX_REVERSAL_ATR
-    )
-
-    log.info(
-        "Automatic trading = DISABLED"
-    )
-
-    state = load_state()
-
-    # ========================================================
-    # SYMBOL DISCOVERY
-    # ========================================================
+    data = {}
 
     try:
+        for name, granularity in TIMEFRAMES.items():
 
-        symbols = get_active_symbols()
+            count = 220
+
+            if name == "5M":
+                count = 300
+
+            df = get_candles(
+                symbol,
+                granularity,
+                count
+            )
+
+            data[name] = df
+
+        # 12H from 4H
+        data["12H"] = build_12h_from_4h(
+            data["4H"]
+        )
 
     except Exception as e:
 
-        log.exception(
-            "SYMBOL DISCOVERY ERROR: %s",
+        print(
+            f"{target} DATA ERROR:",
             e
         )
 
         return
 
-    log.info(
-        "Discovered symbols: %s",
-        symbols
-    )
+    # --------------------------------------------------------
+    # SNAPSHOTS
+    # --------------------------------------------------------
 
-    # ========================================================
-    # MISSING TARGETS
-    # ========================================================
+    snapshots = {}
 
-    missing = [
+    for tf in [
+        "12H",
+        "4H",
+        "1H",
+        "15M",
+    ]:
 
-        name
-
-        for name in TARGET_NAMES
-
-        if name not in symbols
-    ]
-
-    if missing:
-
-        log.warning(
-            "Missing targets: %s",
-            ", ".join(missing)
+        snap = indicator_snapshot(
+            data[tf]
         )
 
-    found = [
+        snapshots[tf] = snap
 
-        name
+    if not snapshots["12H"]:
+        print(
+            f"{target} 12H unavailable"
+        )
+        return
 
-        for name in TARGET_NAMES
+    # --------------------------------------------------------
+    # 12H DEBUG
+    # --------------------------------------------------------
 
-        if name in symbols
-    ]
+    h12 = snapshots["12H"]
 
-    log.info(
-        "Found %d/%d target indices",
-        len(found),
-        len(TARGET_NAMES)
+    print(
+        f"{target} 12H "
+        f"regime={h12['direction']} "
+        f"bull_score={h12['bullish_score']}/3 "
+        f"bear_score={h12['bearish_score']}/3"
     )
 
-    # ========================================================
-    # SCAN ALL
-    # ========================================================
+    # --------------------------------------------------------
+    # HTF ALIGNMENT
+    # --------------------------------------------------------
 
-    for name in TARGET_NAMES:
+    alignment = higher_timeframe_alignment(
+        snapshots,
+        direction
+    )
 
-        symbol = symbols.get(
-            name
+    lower = alignment[
+        "directions"
+    ]
+
+    print(
+        f"{target} ALIGNMENT "
+        f"12H={alignment['h12_ok']} "
+        f"4H={lower.get('4H')} "
+        f"1H={lower.get('1H')} "
+        f"15M={lower.get('15M')} "
+        f"agreement="
+        f"{alignment['lower_agreement']}/3"
+    )
+
+    # --------------------------------------------------------
+    # CURRENT SETUP STATE
+    # --------------------------------------------------------
+
+    setup = get_setup(
+        target
+    )
+
+    # --------------------------------------------------------
+    # IF NO ACTIVE SPIKE:
+    # SEARCH FOR ONE
+    # --------------------------------------------------------
+
+    if not setup:
+
+        candidate = detect_recent_spike(
+            data["5M"],
+            direction
+        )
+
+        if candidate:
+
+            setup = create_spike_state(
+                data["5M"],
+                candidate,
+                direction
+            )
+
+            store_setup(
+                target,
+                setup
+            )
+
+            save_state(
+                STATE
+            )
+
+            print(
+                f"{target} NEW SPIKE "
+                f"size="
+                f"{candidate['move_atr']:.2f} ATR "
+                f"bars="
+                f"{candidate['bars']}"
+            )
+
+        else:
+
+            print(
+                f"{target} WAITING FOR SPIKE"
+            )
+
+            return
+
+    # --------------------------------------------------------
+    # ANALYSE ACTIVE SETUP
+    # --------------------------------------------------------
+
+    structure = analyse_active_setup(
+        data["5M"],
+        setup,
+        direction
+    )
+
+    # Add original spike size if missing
+    structure[
+        "spike_size_atr"
+    ] = setup.get(
+        "spike_size_atr",
+        0
+    )
+
+    structure[
+        "spike_body_atr"
+    ] = setup.get(
+        "spike_body_atr",
+        0
+    )
+
+    phase = structure.get(
+        "phase"
+    )
+
+    print(
+        f"{target} STRUCTURE "
+        f"phase={phase} "
+        f"age={structure.get('age')} "
+        f"spike="
+        f"{setup.get('spike_size_atr', 0):.2f} "
+        f"ATR "
+        f"pullback="
+        f"{structure.get('pullback_atr', 0):.2f} ATR"
+    )
+
+    # --------------------------------------------------------
+    # INVALID SETUP
+    # --------------------------------------------------------
+
+    if not structure.get(
+        "valid",
+        False
+    ):
+
+        print(
+            f"{target} SETUP RESET "
+            f"reason={phase}"
+        )
+
+        clear_setup(
+            target
+        )
+
+        save_state(
+            STATE
+        )
+
+        # Search immediately for another recent spike.
+        candidate = detect_recent_spike(
+            data["5M"],
+            direction
+        )
+
+        if candidate:
+
+            new_setup = create_spike_state(
+                data["5M"],
+                candidate,
+                direction
+            )
+
+            store_setup(
+                target,
+                new_setup
+            )
+
+            save_state(
+                STATE
+            )
+
+            print(
+                f"{target} REPLACED SPIKE "
+                f"size="
+                f"{candidate['move_atr']:.2f} ATR"
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # 5M TRIGGER
+    # --------------------------------------------------------
+
+    five_trigger, five_rsi = (
+        five_minute_trigger(
+            data["5M"],
+            direction
+        )
+    )
+
+    print(
+        f"{target} 5M "
+        f"trigger={five_trigger} "
+        f"RSI={five_rsi:.1f}"
+    )
+
+    # --------------------------------------------------------
+    # ONLY ENTRY PHASES CAN BECOME SIGNALS
+    # --------------------------------------------------------
+
+    ready_phase = phase in [
+        "PULLBACK_WEAKENING",
+        "CONTROLLED_REVERSAL",
+    ]
+
+    if not ready_phase:
+
+        if phase in [
+            "WAITING_FOR_PULLBACK",
+            "SPIKE_DETECTED",
+            "WAITING_FOR_CONTROLLED_REVERSAL",
+            "PULLBACK_STALE",
+            "PULLBACK_BUT_CANDLE_TOO_LARGE",
+        ]:
+
+            print(
+                f"{target} WAITING "
+                f"phase={phase}"
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # HARD HTF PROTECTION
+    # --------------------------------------------------------
+
+    if not alignment[
+        "h12_ok"
+    ]:
+
+        print(
+            f"{target} BLOCKED "
+            f"- 12H regime does not agree "
+            f"with {direction}"
+        )
+
+        return
+
+    if not alignment[
+        "lower_ok"
+    ]:
+
+        print(
+            f"{target} BLOCKED "
+            f"- only "
+            f"{alignment['lower_agreement']}/3 "
+            f"lower HTFs agree"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 5M ENTRY
+    # --------------------------------------------------------
+
+    if REQUIRE_5M_TRIGGER and not five_trigger:
+
+        print(
+            f"{target} BLOCKED "
+            f"- 5M trigger not ready"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    score = calculate_score(
+        structure,
+        alignment,
+        five_trigger
+    )
+
+    print(
+        f"{target} TECHNICAL SCORE "
+        f"{score}/10"
+    )
+
+    if score < SIGNAL_MIN:
+
+        print(
+            f"{target} BELOW SIGNAL SCORE"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # DUPLICATE CONTROL
+    # --------------------------------------------------------
+
+    candle_time = (
+        data["5M"]
+        .iloc[-1]["time"]
+        .isoformat()
+    )
+
+    if was_sent(
+        target,
+        candle_time
+    ):
+
+        print(
+            f"{target} DUPLICATE "
+            f"already sent"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # GROQ ADVISORY
+    # --------------------------------------------------------
+
+    groq = groq_review(
+        target,
+        direction,
+        score,
+        structure,
+        alignment,
+        five_trigger,
+    )
+
+    print(
+        f"{target} GROQ "
+        f"{groq['decision']} "
+        f"{groq['confidence']}%"
+    )
+
+    # IMPORTANT:
+    # Groq does NOT veto a technically valid signal.
+    # It is advisory only.
+
+    message = build_signal_message(
+        target,
+        direction,
+        score,
+        structure,
+        alignment,
+        five_rsi,
+        groq,
+    )
+
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
+
+    sent = send_telegram(
+        message
+    )
+
+    if sent:
+
+        mark_sent(
+            target,
+            candle_time
+        )
+
+        # Clear setup after signal so it doesn't fire again.
+        clear_setup(
+            target
+        )
+
+        save_state(
+            STATE
+        )
+
+        print(
+            f"{target} >>> SIGNAL SENT <<<"
+        )
+
+    else:
+
+        print(
+            f"{target} TELEGRAM FAILED"
+        )
+
+
+# ============================================================
+# CLEAN OLD SETUPS
+# ============================================================
+
+def clean_old_setups():
+    """
+    Prevent permanently stuck states.
+    """
+
+    remove = []
+
+    for target, setup in STATE[
+        "setups"
+    ].items():
+
+        try:
+            created = setup.get(
+                "created_at"
+            )
+
+            if not created:
+                remove.append(target)
+                continue
+
+            created_dt = datetime.fromisoformat(
+                created
+            )
+
+            age_seconds = (
+                now_utc()
+                - created_dt
+            ).total_seconds()
+
+            # Maximum life of a setup:
+            # roughly 20 minutes.
+            if age_seconds > 20 * 60:
+                remove.append(target)
+
+        except Exception:
+            remove.append(target)
+
+    for target in remove:
+        STATE["setups"].pop(
+            target,
+            None
+        )
+
+    if remove:
+        save_state(
+            STATE
+        )
+
+
+# ============================================================
+# MAIN SCAN
+# ============================================================
+
+def scan_cycle(symbol_map):
+    print("")
+    print("=" * 65)
+    print(
+        f"STARTING SCAN CYCLE "
+        f"{datetime.now(timezone.utc).isoformat()}"
+    )
+    print(
+        f"VERSION: {VERSION}"
+    )
+    print("=" * 65)
+
+    clean_old_setups()
+
+    for target in TARGETS:
+
+        symbol = symbol_map.get(
+            target
         )
 
         if not symbol:
+
+            print(
+                f"{target} "
+                f"NO SYMBOL MAPPING"
+            )
 
             continue
 
         try:
 
             scan_one(
-                name,
-                symbol,
-                state
+                target,
+                symbol
             )
 
         except Exception as e:
 
-            log.exception(
-                "%s ERROR: %s",
-                name,
+            print(
+                f"{target} SCAN ERROR:",
                 e
             )
 
-    # ========================================================
-    # SAVE STATE
-    # ========================================================
+            traceback.print_exc()
 
-    try:
-
-        save_state(
-            state
-        )
-
-    except Exception as e:
-
-        log.error(
-            "STATE SAVE ERROR: %s",
-            e
-        )
-
-    log.info(
-        "SCAN CYCLE FINISHED"
+    save_state(
+        STATE
     )
 
-    log.info(
-        "======================================" 
+    print("")
+    print(
+        "CYCLE FINISHED"
     )
 
 
 # ============================================================
-# MAIN
+# STARTUP CHECK
+# ============================================================
+
+def startup_check():
+
+    print("")
+    print("=" * 65)
+    print(
+        "DERIV CRASH/BOOM PULLBACK SCANNER"
+    )
+    print(
+        f"VERSION: {VERSION}"
+    )
+    print("=" * 65)
+
+    print(
+        f"Scan interval: "
+        f"{SCAN_INTERVAL_SECONDS}s"
+    )
+
+    print(
+        f"Targets: "
+        f"{len(TARGETS)}"
+    )
+
+    print(
+        "Automatic trading: DISABLED"
+    )
+
+    print(
+        "Crash direction: SELL only"
+    )
+
+    print(
+        "Boom direction: BUY only"
+    )
+
+    print(
+        "12H filter: 2-of-3 broad regime"
+    )
+
+    print(
+        "Lower HTFs: 2-of-3"
+    )
+
+    print(
+        "5M: entry trigger"
+    )
+
+    print(
+        f"Signal minimum: "
+        f"{SIGNAL_MIN}/10"
+    )
+
+    if not TELEGRAM_BOT_TOKEN:
+        print(
+            "WARNING: TELEGRAM_BOT_TOKEN missing"
+        )
+
+    if not TELEGRAM_CHAT_ID:
+        print(
+            "WARNING: TELEGRAM_CHAT_ID missing"
+        )
+
+    if not GROQ_API_KEY:
+        print(
+            "INFO: GROQ_API_KEY not configured "
+            "- AI review disabled"
+        )
+
+    print("=" * 65)
+    print("")
+
+
+# ============================================================
+# PROGRAM
 # ============================================================
 
 def main():
 
-    log.info(
-        "======================================"
-    )
+    startup_check()
 
-    log.info(
-        "SYNTHETIC PULLBACK SCANNER STARTING"
-    )
+    symbol_map = get_symbol_map()
 
-    log.info(
-        "10 TARGETS ENABLED"
-    )
+    if not symbol_map:
 
-    log.info(
-        "CRASH = SELL ONLY"
-    )
+        print(
+            "ERROR: Could not discover "
+            "Crash/Boom symbols."
+        )
 
-    log.info(
-        "BOOM = BUY ONLY"
-    )
+        # Retry later instead of killing Railway.
+        while True:
 
-    log.info(
-        "Pattern = SPIKE -> PULLBACK -> WEAKENING -> REVERSAL"
-    )
+            time.sleep(
+                60
+            )
 
-    log.info(
-        "12H = HARD DIRECTION FILTER"
-    )
+            symbol_map = get_symbol_map()
 
-    log.info(
-        "4H + 1H + 15M = MUST AGREE"
-    )
-
-    log.info(
-        "5M = ENTRY REVERSAL"
-    )
-
-    log.info(
-        "Maximum reversal = %.2f ATR",
-        MAX_REVERSAL_ATR
-    )
-
-    log.info(
-        "Scan interval = %d seconds",
-        SCAN_INTERVAL_SECONDS
-    )
-
-    log.info(
-        "Automatic trading = DISABLED"
-    )
-
-    log.info(
-        "======================================"
-    )
+            if symbol_map:
+                break
 
     while True:
 
-        started = time.time()
+        cycle_start = time.time()
 
         try:
 
-            run_scan()
+            # Refresh mapping occasionally.
+            if (
+                not symbol_map
+                or
+                len(symbol_map)
+                < len(TARGETS)
+            ):
+                new_map = discover_symbols()
+
+                if new_map:
+                    symbol_map = new_map
+                    STATE[
+                        "symbol_map"
+                    ] = new_map
+
+                    save_state(
+                        STATE
+                    )
+
+            scan_cycle(
+                symbol_map
+            )
 
         except Exception as e:
 
-            log.exception(
-                "UNEXPECTED SCANNER ERROR: %s",
+            print(
+                "MAIN LOOP ERROR:",
                 e
             )
 
+            traceback.print_exc()
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Don't sleep 300 seconds AFTER a 28-second cycle.
+        # That makes the actual cycle ~328 seconds.
+        #
+        # Instead, keep the cycle interval approximately
+        # equal to SCAN_INTERVAL_SECONDS.
+        # ----------------------------------------------------
+
         elapsed = (
             time.time()
-            -
-            started
+            - cycle_start
         )
 
-        log.info(
-            (
-                "Next scan in %d seconds "
-                "(cycle took %.1f seconds)"
-            ),
-
-            SCAN_INTERVAL_SECONDS,
-
-            elapsed
+        sleep_for = max(
+            5,
+            SCAN_INTERVAL_SECONDS
+            - elapsed
         )
 
-        try:
+        print(
+            f"Next scan in "
+            f"{sleep_for:.1f} seconds"
+        )
 
-            time.sleep(
-                SCAN_INTERVAL_SECONDS
-            )
+        time.sleep(
+            sleep_for
+        )
 
-        except KeyboardInterrupt:
-
-            log.info(
-                "Scanner stopped."
-            )
-
-            break
-
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
